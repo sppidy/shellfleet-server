@@ -222,14 +222,69 @@ async fn agent_ws_handler(
         .into_response()
 }
 
+/// Returns the allowed Origin set for /ui/ws. Always includes the
+/// `UI_URL` origin; `WS_ALLOWED_ORIGINS` (comma-separated) is appended.
+fn ws_allowed_origins() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(ui_url) = std::env::var("UI_URL") {
+        if let Some(origin) = url::Url::parse(&ui_url).ok().and_then(|u| {
+            let scheme = u.scheme();
+            let host = u.host_str()?;
+            let port = u.port();
+            Some(match port {
+                Some(p) => format!("{scheme}://{host}:{p}"),
+                None => format!("{scheme}://{host}"),
+            })
+        }) {
+            out.push(origin);
+        }
+    }
+    if let Ok(extra) = std::env::var("WS_ALLOWED_ORIGINS") {
+        for s in extra.split(',') {
+            let t = s.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
 async fn ui_ws_handler(
     jar: CookieJar,
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let mut is_authenticated = false;
+    let dev_mode = std::env::var("JWT_SECRET").unwrap_or_default() == "dev";
 
-    if std::env::var("JWT_SECRET").unwrap_or_default() == "dev" {
+    // 1. Origin allow-list. Browsers always send Origin on a WS upgrade
+    //    they initiated; absence of Origin from a browser is a strong
+    //    indicator of a non-browser client and we reject it. Skip the
+    //    check entirely in dev mode so local tooling still works.
+    if !dev_mode {
+        let allowed = ws_allowed_origins();
+        let origin = headers
+            .get("origin")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let ok = match &origin {
+            Some(o) => allowed.iter().any(|a| a.eq_ignore_ascii_case(o)),
+            None => false,
+        };
+        if !ok {
+            tracing::warn!(
+                origin = ?origin,
+                allowed = ?allowed,
+                "ui ws upgrade rejected: origin not allowed"
+            );
+            return (StatusCode::FORBIDDEN, "origin").into_response();
+        }
+    }
+
+    // 2. Cookie auth.
+    let mut is_authenticated = false;
+    if dev_mode {
         is_authenticated = true;
     } else if let Some(cookie) = jar.get("auth_token") {
         if auth::verify_token(cookie.value()) {
