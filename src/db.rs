@@ -226,6 +226,7 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
             last_bytes INTEGER,
             last_log TEXT,
             updated_at INTEGER NOT NULL DEFAULT 0,
+            mode TEXT NOT NULL DEFAULT 'tar',
             UNIQUE(agent_id, name)
         );
         "#,
@@ -235,6 +236,11 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS backup_jobs_agent ON backup_jobs(agent_id);")
         .execute(&pool)
         .await?;
+    // Idempotent column add for installs that already had the table
+    // before mode landed. SQLite errors if the column exists; ignore.
+    let _ = sqlx::query("ALTER TABLE backup_jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'tar'")
+        .execute(&pool)
+        .await;
 
     migrate_legacy_tokens(&pool).await?;
 
@@ -1019,12 +1025,13 @@ pub struct BackupJobRow {
     pub last_bytes: Option<i64>,
     pub last_log: Option<String>,
     pub updated_at: i64,
+    pub mode: String,
 }
 
 pub async fn list_backup_jobs(pool: &SqlitePool) -> Result<Vec<BackupJobRow>, sqlx::Error> {
     sqlx::query_as::<_, BackupJobRow>(
         "SELECT id, agent_id, name, paths_json, dest, cron_expr, enabled, \
-         last_run_at, last_status, last_archive_path, last_bytes, last_log, updated_at \
+         last_run_at, last_status, last_archive_path, last_bytes, last_log, updated_at, mode \
          FROM backup_jobs ORDER BY agent_id, name",
     )
     .fetch_all(pool)
@@ -1034,7 +1041,7 @@ pub async fn list_backup_jobs(pool: &SqlitePool) -> Result<Vec<BackupJobRow>, sq
 pub async fn get_backup_job(pool: &SqlitePool, id: i64) -> Result<Option<BackupJobRow>, sqlx::Error> {
     sqlx::query_as::<_, BackupJobRow>(
         "SELECT id, agent_id, name, paths_json, dest, cron_expr, enabled, \
-         last_run_at, last_status, last_archive_path, last_bytes, last_log, updated_at \
+         last_run_at, last_status, last_archive_path, last_bytes, last_log, updated_at, mode \
          FROM backup_jobs WHERE id = ?",
     )
     .bind(id)
@@ -1050,17 +1057,19 @@ pub async fn upsert_backup_job(
     dest: &str,
     cron_expr: Option<&str>,
     enabled: bool,
+    mode: &str,
     now: i64,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO backup_jobs (agent_id, name, paths_json, dest, cron_expr, enabled, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO backup_jobs (agent_id, name, paths_json, dest, cron_expr, enabled, mode, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ON CONFLICT(agent_id, name) DO UPDATE SET
             paths_json = excluded.paths_json,
             dest       = excluded.dest,
             cron_expr  = excluded.cron_expr,
             enabled    = excluded.enabled,
+            mode       = excluded.mode,
             updated_at = excluded.updated_at
         "#,
     )
@@ -1070,6 +1079,7 @@ pub async fn upsert_backup_job(
     .bind(dest)
     .bind(cron_expr)
     .bind(if enabled { 1 } else { 0 })
+    .bind(mode)
     .bind(now)
     .execute(pool)
     .await?;

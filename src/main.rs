@@ -46,6 +46,11 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+pub type PendingBackupListTx =
+    tokio::sync::oneshot::Sender<shared::Message>;
+pub type PendingBackupRestoreTx =
+    tokio::sync::oneshot::Sender<shared::Message>;
+
 pub struct AppState {
     pub agents: Mutex<HashMap<String, AgentTx>>,
     pub ui_clients: Mutex<HashMap<u64, UiTx>>,
@@ -55,6 +60,13 @@ pub struct AppState {
     /// be attributed to the auto-update scheduler (or `run_now` button)
     /// rather than a UI-driven upgrade. Cleared when the response lands.
     pub scheduled_apt_runs: Mutex<HashSet<String>>,
+    /// Per-agent oneshot waiters for `BackupListArchivesResponse`. The
+    /// HTTP handler pushes a sender here and awaits the channel; the
+    /// WS receive loop pops the most recent waiter for that agent and
+    /// forwards the response.
+    pub pending_backup_lists: Mutex<HashMap<String, std::collections::VecDeque<PendingBackupListTx>>>,
+    pub pending_backup_restores:
+        Mutex<HashMap<String, std::collections::VecDeque<PendingBackupRestoreTx>>>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +177,8 @@ async fn main() {
         ui_id_counter: AtomicU64::new(0),
         db: pool,
         scheduled_apt_runs: Mutex::new(HashSet::new()),
+        pending_backup_lists: Mutex::new(HashMap::new()),
+        pending_backup_restores: Mutex::new(HashMap::new()),
     });
 
     update_windows::spawn_scheduler(state.clone());
@@ -482,6 +496,25 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                                 }
                             }
                         }
+                        // Backup list-archives / restore: pop oldest
+                        // pending oneshot for this agent and resolve.
+                        if matches!(other, Message::BackupListArchivesResponse { .. }) {
+                            let mut waiters = state.pending_backup_lists.lock().await;
+                            if let Some(q) = waiters.get_mut(agent_id) {
+                                if let Some(tx) = q.pop_front() {
+                                    let _ = tx.send(other.clone());
+                                }
+                            }
+                        }
+                        if matches!(other, Message::BackupRestoreResponse { .. }) {
+                            let mut waiters = state.pending_backup_restores.lock().await;
+                            if let Some(q) = waiters.get_mut(agent_id) {
+                                if let Some(tx) = q.pop_front() {
+                                    let _ = tx.send(other.clone());
+                                }
+                            }
+                        }
+
                         // Backup result attribution.
                         if let Message::BackupRunResponse {
                             id,

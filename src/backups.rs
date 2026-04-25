@@ -12,7 +12,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
-use shared::Message;
+use shared::{BackupMode, Message};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -23,6 +23,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/", get(list_handler).post(upsert_handler))
         .route("/{id}", delete(delete_handler))
         .route("/{id}/run", post(run_now_handler))
+        .route("/{id}/archives", post(list_archives_handler))
+        .route("/{id}/restore", post(restore_handler))
 }
 
 #[derive(Serialize)]
@@ -34,6 +36,7 @@ struct JobOut {
     dest: String,
     cron_expr: Option<String>,
     enabled: bool,
+    mode: String,
     last_run_at: i64,
     last_status: Option<String>,
     last_archive_path: Option<String>,
@@ -65,6 +68,7 @@ fn to_out(row: db::BackupJobRow) -> JobOut {
         dest: row.dest,
         cron_expr: row.cron_expr,
         enabled: row.enabled != 0,
+        mode: row.mode,
         last_run_at: row.last_run_at,
         last_status: row.last_status,
         last_archive_path: row.last_archive_path,
@@ -75,13 +79,21 @@ fn to_out(row: db::BackupJobRow) -> JobOut {
     }
 }
 
+fn parse_mode(s: &str) -> BackupMode {
+    match s {
+        "restic" => BackupMode::Restic,
+        _ => BackupMode::Tar,
+    }
+}
+
 #[derive(Deserialize)]
 struct UpsertBody {
     agent_id: String,
     name: String,
     paths: Vec<String>,
-    /// Local path on the agent host. v1 only supports local destinations
-    /// (no scheme, or `file://path`). `s3://...` is reserved for v2.
+    /// Destination URI:
+    ///   - bare path or `file:///...` — local filesystem on the agent
+    ///   - `s3://bucket/prefix` — uploaded via the agent's `aws` CLI
     dest: String,
     /// Optional cron expression (7-field, UTC). When set, the scheduler
     /// fires the job. When absent, the job only runs via run-now.
@@ -89,6 +101,15 @@ struct UpsertBody {
     cron_expr: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+    /// "tar" (default) or "restic". Restic mode is field-shaped for
+    /// the future and currently rejected by the agent with a clear
+    /// "not implemented" message.
+    #[serde(default = "default_mode")]
+    mode: String,
+}
+
+fn default_mode() -> String {
+    "tar".to_string()
 }
 
 fn default_true() -> bool {
@@ -165,6 +186,7 @@ async fn upsert_handler(
         &body.dest,
         cron_for_db,
         body.enabled,
+        if body.mode == "restic" { "restic" } else { "tar" },
         now,
     )
     .await
@@ -260,6 +282,7 @@ async fn run_now_handler(
         name: row.name.clone(),
         paths,
         dest: row.dest.clone(),
+        mode: parse_mode(&row.mode),
     };
     if tx.send(req).is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "send failed").into_response();
@@ -277,6 +300,151 @@ async fn run_now_handler(
     )
     .await;
     (StatusCode::OK, "Triggered").into_response()
+}
+
+async fn list_archives_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if require_auth(&jar).is_none() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    let row = match db::get_backup_job(&state.db, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such job").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "get backup_job failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        }
+    };
+    let agents = state.agents.lock().await;
+    let Some(tx) = agents.get(&row.agent_id).cloned() else {
+        return (StatusCode::NOT_FOUND, "agent offline").into_response();
+    };
+    drop(agents);
+
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    {
+        let mut waiters = state.pending_backup_lists.lock().await;
+        waiters
+            .entry(row.agent_id.clone())
+            .or_default()
+            .push_back(otx);
+    }
+    let req = Message::BackupListArchivesRequest {
+        id: row.id.to_string(),
+        name: row.name.clone(),
+        dest: row.dest.clone(),
+    };
+    if tx.send(req).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "send failed").into_response();
+    }
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(20), orx).await {
+        Ok(Ok(m)) => m,
+        Ok(Err(_)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "agent dropped").into_response();
+        }
+        Err(_) => {
+            return (StatusCode::REQUEST_TIMEOUT, "timeout waiting for agent").into_response();
+        }
+    };
+    if let Message::BackupListArchivesResponse { success, archives, error, .. } = resp {
+        if !success {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.unwrap_or_else(|| "unknown".into()),
+            )
+                .into_response();
+        }
+        Json(archives).into_response()
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "unexpected message").into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct RestoreBody {
+    archive_uri: String,
+    dest_root: String,
+}
+
+#[derive(Serialize)]
+struct RestoreOut {
+    success: bool,
+    log: String,
+    error: Option<String>,
+}
+
+async fn restore_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RestoreBody>,
+) -> impl IntoResponse {
+    let Some(actor) = require_auth(&jar) else {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    };
+    if body.archive_uri.is_empty() || body.dest_root.is_empty() {
+        return (StatusCode::BAD_REQUEST, "archive_uri and dest_root required").into_response();
+    }
+    let row = match db::get_backup_job(&state.db, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such job").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "get backup_job failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        }
+    };
+    let agents = state.agents.lock().await;
+    let Some(tx) = agents.get(&row.agent_id).cloned() else {
+        return (StatusCode::NOT_FOUND, "agent offline").into_response();
+    };
+    drop(agents);
+
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    {
+        let mut waiters = state.pending_backup_restores.lock().await;
+        waiters
+            .entry(row.agent_id.clone())
+            .or_default()
+            .push_back(otx);
+    }
+    let req = Message::BackupRestoreRequest {
+        id: row.id.to_string(),
+        archive_uri: body.archive_uri.clone(),
+        dest_root: body.dest_root.clone(),
+    };
+    if tx.send(req).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "send failed").into_response();
+    }
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(120), orx).await {
+        Ok(Ok(m)) => m,
+        Ok(Err(_)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "agent dropped").into_response();
+        }
+        Err(_) => {
+            return (StatusCode::REQUEST_TIMEOUT, "timeout waiting for agent").into_response();
+        }
+    };
+    if let Message::BackupRestoreResponse { success, log, error, .. } = resp {
+        db::record_audit(
+            &state.db,
+            crate::now_unix(),
+            Some(&actor),
+            Some(&row.agent_id),
+            "backup_job.restore",
+            success,
+            Some(&format!(
+                "name={} archive={} dest={}",
+                row.name, body.archive_uri, body.dest_root
+            )),
+        )
+        .await;
+        Json(RestoreOut { success, log, error }).into_response()
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "unexpected message").into_response()
+    }
 }
 
 /// Background loop: every 60s, scan enabled jobs with a cron set; if
@@ -331,6 +499,7 @@ async fn scheduler_tick(state: &AppState) -> Result<(), sqlx::Error> {
             name: row.name.clone(),
             paths,
             dest: row.dest.clone(),
+            mode: parse_mode(&row.mode),
         };
         if tx.send(req).is_err() {
             tracing::warn!(agent_id = %row.agent_id, "failed to send scheduled BackupRunRequest");
