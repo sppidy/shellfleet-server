@@ -6,6 +6,7 @@ mod fan_out;
 mod health;
 mod tokens;
 mod update_windows;
+mod webhook;
 
 use axum::{
     extract::{Query, State, ws::{Message as WsMessage, WebSocket, WebSocketUpgrade}},
@@ -444,6 +445,14 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                                     error.as_deref(),
                                 )
                                 .await;
+                                webhook::fire_update_result(
+                                    state.db.clone(),
+                                    agent_id.clone(),
+                                    status.to_string(),
+                                    log_combined.clone(),
+                                    error.clone(),
+                                    now_unix(),
+                                );
                             }
                         }
                         let ui_msg = UiMessage::AgentMessage {
