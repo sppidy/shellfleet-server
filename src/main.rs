@@ -1,9 +1,11 @@
 mod auth;
+mod backups;
 mod csrf;
 mod db;
 mod device_auth;
 mod fan_out;
 mod health;
+mod labels;
 mod notifications;
 mod tokens;
 mod update_windows;
@@ -166,6 +168,7 @@ async fn main() {
     });
 
     update_windows::spawn_scheduler(state.clone());
+    backups::spawn_scheduler(state.clone());
 
     let api_routes = Router::new()
         .nest("/device", device_auth::routes())
@@ -174,6 +177,8 @@ async fn main() {
         .nest("/health-probes", health::routes())
         .nest("/fan-out", fan_out::routes())
         .nest("/notifications", notifications::routes())
+        .nest("/backups", backups::routes())
+        .nest("/agent-labels", labels::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
@@ -475,6 +480,71 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                                         .await;
                                     }
                                 }
+                            }
+                        }
+                        // Backup result attribution.
+                        if let Message::BackupRunResponse {
+                            id,
+                            name,
+                            success,
+                            archive_path,
+                            bytes,
+                            log,
+                            error,
+                        } = &other
+                        {
+                            if let Ok(job_id) = id.parse::<i64>() {
+                                let status = if *success { "success" } else { "failed" };
+                                let combined = match error {
+                                    Some(e) if !e.is_empty() => {
+                                        format!("{log}\n[error] {e}")
+                                    }
+                                    _ => log.clone(),
+                                };
+                                if let Err(e) = db::record_backup_job_result(
+                                    &state.db,
+                                    job_id,
+                                    now_unix(),
+                                    status,
+                                    archive_path,
+                                    *bytes as i64,
+                                    &combined,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(error = %e, "persist backup result failed");
+                                }
+                                db::record_audit(
+                                    &state.db,
+                                    now_unix(),
+                                    Some("scheduler"),
+                                    Some(agent_id),
+                                    "backup_job.result",
+                                    *success,
+                                    Some(&format!(
+                                        "name={name} bytes={bytes} archive={archive_path}"
+                                    )),
+                                )
+                                .await;
+                                let level = if *success { "info" } else { "error" };
+                                let title = format!(
+                                    "backup '{name}' on {} → {status}",
+                                    agent_id.trim_end_matches("-id")
+                                );
+                                let body_summary = if *success {
+                                    format!("{bytes} bytes → {archive_path}")
+                                } else {
+                                    error.clone().unwrap_or_else(|| "failed".into())
+                                };
+                                notifications::notify(
+                                    &state.db,
+                                    "backup_job.result",
+                                    Some(agent_id),
+                                    level,
+                                    &title,
+                                    Some(&body_summary),
+                                )
+                                .await;
                             }
                         }
                         // Fan-out attribution: if a fan_out_run is

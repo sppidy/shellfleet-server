@@ -195,6 +195,47 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_labels (
+            agent_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            PRIMARY KEY (agent_id, label)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS agent_labels_label ON agent_labels(label);")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS backup_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            paths_json TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            cron_expr TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_at INTEGER NOT NULL DEFAULT 0,
+            last_status TEXT,
+            last_archive_path TEXT,
+            last_bytes INTEGER,
+            last_log TEXT,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(agent_id, name)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS backup_jobs_agent ON backup_jobs(agent_id);")
+        .execute(&pool)
+        .await?;
+
     migrate_legacy_tokens(&pool).await?;
 
     Ok(pool)
@@ -909,6 +950,176 @@ pub async fn delete_notification(pool: &SqlitePool, id: i64) -> Result<bool, sql
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
+}
+
+// ---------- agent_labels ----------
+
+pub async fn list_all_labels(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT agent_id, label FROM agent_labels ORDER BY agent_id, label",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_labels_for(pool: &SqlitePool, agent_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT label FROM agent_labels WHERE agent_id = ? ORDER BY label",
+    )
+    .bind(agent_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn agents_for_label(pool: &SqlitePool, label: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT agent_id FROM agent_labels WHERE label = ? ORDER BY agent_id",
+    )
+    .bind(label)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn add_label(pool: &SqlitePool, agent_id: &str, label: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT OR IGNORE INTO agent_labels (agent_id, label) VALUES (?1, ?2)")
+        .bind(agent_id)
+        .bind(label)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_label(
+    pool: &SqlitePool,
+    agent_id: &str,
+    label: &str,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM agent_labels WHERE agent_id = ?1 AND label = ?2")
+        .bind(agent_id)
+        .bind(label)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+// ---------- backup_jobs ----------
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct BackupJobRow {
+    pub id: i64,
+    pub agent_id: String,
+    pub name: String,
+    pub paths_json: String,
+    pub dest: String,
+    pub cron_expr: Option<String>,
+    pub enabled: i64,
+    pub last_run_at: i64,
+    pub last_status: Option<String>,
+    pub last_archive_path: Option<String>,
+    pub last_bytes: Option<i64>,
+    pub last_log: Option<String>,
+    pub updated_at: i64,
+}
+
+pub async fn list_backup_jobs(pool: &SqlitePool) -> Result<Vec<BackupJobRow>, sqlx::Error> {
+    sqlx::query_as::<_, BackupJobRow>(
+        "SELECT id, agent_id, name, paths_json, dest, cron_expr, enabled, \
+         last_run_at, last_status, last_archive_path, last_bytes, last_log, updated_at \
+         FROM backup_jobs ORDER BY agent_id, name",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_backup_job(pool: &SqlitePool, id: i64) -> Result<Option<BackupJobRow>, sqlx::Error> {
+    sqlx::query_as::<_, BackupJobRow>(
+        "SELECT id, agent_id, name, paths_json, dest, cron_expr, enabled, \
+         last_run_at, last_status, last_archive_path, last_bytes, last_log, updated_at \
+         FROM backup_jobs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn upsert_backup_job(
+    pool: &SqlitePool,
+    agent_id: &str,
+    name: &str,
+    paths_json: &str,
+    dest: &str,
+    cron_expr: Option<&str>,
+    enabled: bool,
+    now: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO backup_jobs (agent_id, name, paths_json, dest, cron_expr, enabled, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(agent_id, name) DO UPDATE SET
+            paths_json = excluded.paths_json,
+            dest       = excluded.dest,
+            cron_expr  = excluded.cron_expr,
+            enabled    = excluded.enabled,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(agent_id)
+    .bind(name)
+    .bind(paths_json)
+    .bind(dest)
+    .bind(cron_expr)
+    .bind(if enabled { 1 } else { 0 })
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM backup_jobs WHERE agent_id = ?1 AND name = ?2",
+    )
+    .bind(agent_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn delete_backup_job(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM backup_jobs WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn record_backup_job_result(
+    pool: &SqlitePool,
+    id: i64,
+    last_run_at: i64,
+    last_status: &str,
+    last_archive_path: &str,
+    last_bytes: i64,
+    last_log: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE backup_jobs
+           SET last_run_at = ?2,
+               last_status = ?3,
+               last_archive_path = ?4,
+               last_bytes = ?5,
+               last_log = ?6
+         WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(last_run_at)
+    .bind(last_status)
+    .bind(last_archive_path)
+    .bind(last_bytes)
+    .bind(last_log)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn recent_audit(pool: &SqlitePool, limit: i64) -> Result<Vec<AuditRow>, sqlx::Error> {

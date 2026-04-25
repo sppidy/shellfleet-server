@@ -43,9 +43,15 @@ fn require_auth(jar: &CookieJar) -> Option<String> {
 struct CreateBody {
     /// One of `apt-status`, `apt-upgrade`, `docker-list`.
     kind: String,
-    /// Agent ids to target. Each agent that's offline gets recorded
-    /// immediately with status="offline".
+    /// Agent ids to target. Either this OR `label` must be provided.
+    /// Agents that are offline get recorded immediately with
+    /// status="offline".
+    #[serde(default)]
     agent_ids: Vec<String>,
+    /// Resolve targets by label instead of by id. When set, the
+    /// server expands to all agents tagged with this label.
+    #[serde(default)]
+    label: Option<String>,
     /// Optional kind-specific payload. For `apt-upgrade`, this is the
     /// package name (None = full upgrade).
     #[serde(default)]
@@ -111,12 +117,28 @@ async fn create_handler(
     let Some(actor) = require_auth(&jar) else {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     };
-    if body.agent_ids.is_empty() {
-        return (StatusCode::BAD_REQUEST, "agent_ids must not be empty").into_response();
-    }
     let Some(message_template) = message_for(&body.kind, body.package.clone()) else {
         return (StatusCode::BAD_REQUEST, "unsupported kind").into_response();
     };
+    // Resolve targets — either explicit ids or by label.
+    let agent_ids: Vec<String> = if let Some(label) = body.label.as_deref() {
+        match db::agents_for_label(&state.db, label).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(error = %e, "resolve label failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+            }
+        }
+    } else {
+        body.agent_ids.clone()
+    };
+    if agent_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "no targets — provide agent_ids or a label that resolves to at least one agent",
+        )
+            .into_response();
+    }
     let now = crate::now_unix();
     let payload_json = body.package.as_ref().map(|p| format!("{{\"package\":\"{p}\"}}"));
     let run_id = match db::create_fan_out_run(
@@ -142,12 +164,17 @@ async fn create_handler(
         None,
         "fan_out.create",
         true,
-        Some(&format!("kind={} agents={}", body.kind, body.agent_ids.len())),
+        Some(&format!(
+            "kind={} agents={} label={:?}",
+            body.kind,
+            agent_ids.len(),
+            body.label.as_deref().unwrap_or("")
+        )),
     )
     .await;
 
     let agents = state.agents.lock().await;
-    for agent_id in &body.agent_ids {
+    for agent_id in &agent_ids {
         if let Some(tx) = agents.get(agent_id) {
             // Mark pending up-front so response routing can find it.
             let _ = db::upsert_fan_out_result(
