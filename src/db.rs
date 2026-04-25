@@ -112,6 +112,35 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS health_probes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            target TEXT NOT NULL,
+            interval_secs INTEGER NOT NULL DEFAULT 30,
+            timeout_secs INTEGER NOT NULL DEFAULT 5,
+            expect_status INTEGER,
+            expect_body TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_at INTEGER NOT NULL DEFAULT 0,
+            last_state TEXT,
+            last_latency_ms INTEGER,
+            last_detail TEXT,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(agent_id, name)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS health_probes_agent ON health_probes(agent_id);")
+        .execute(&pool)
+        .await?;
+
     migrate_legacy_tokens(&pool).await?;
 
     Ok(pool)
@@ -461,6 +490,155 @@ pub async fn record_update_window_result(
     .bind(last_run_at)
     .bind(last_status)
     .bind(last_log)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct HealthProbeRow {
+    pub id: i64,
+    pub agent_id: String,
+    pub name: String,
+    pub kind: String,
+    pub target: String,
+    pub interval_secs: i64,
+    pub timeout_secs: i64,
+    pub expect_status: Option<i64>,
+    pub expect_body: Option<String>,
+    pub enabled: i64,
+    pub last_run_at: i64,
+    pub last_state: Option<String>,
+    pub last_latency_ms: Option<i64>,
+    pub last_detail: Option<String>,
+    pub updated_at: i64,
+}
+
+pub async fn list_health_probes(
+    pool: &SqlitePool,
+) -> Result<Vec<HealthProbeRow>, sqlx::Error> {
+    sqlx::query_as::<_, HealthProbeRow>(
+        "SELECT id, agent_id, name, kind, target, interval_secs, timeout_secs, \
+         expect_status, expect_body, enabled, last_run_at, last_state, \
+         last_latency_ms, last_detail, updated_at \
+         FROM health_probes ORDER BY agent_id, name",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_health_probes_for(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> Result<Vec<HealthProbeRow>, sqlx::Error> {
+    sqlx::query_as::<_, HealthProbeRow>(
+        "SELECT id, agent_id, name, kind, target, interval_secs, timeout_secs, \
+         expect_status, expect_body, enabled, last_run_at, last_state, \
+         last_latency_ms, last_detail, updated_at \
+         FROM health_probes WHERE agent_id = ? ORDER BY name",
+    )
+    .bind(agent_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn upsert_health_probe(
+    pool: &SqlitePool,
+    agent_id: &str,
+    name: &str,
+    kind: &str,
+    target: &str,
+    interval_secs: i64,
+    timeout_secs: i64,
+    expect_status: Option<i64>,
+    expect_body: Option<&str>,
+    enabled: bool,
+    now: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO health_probes (
+            agent_id, name, kind, target, interval_secs, timeout_secs,
+            expect_status, expect_body, enabled, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(agent_id, name) DO UPDATE SET
+            kind          = excluded.kind,
+            target        = excluded.target,
+            interval_secs = excluded.interval_secs,
+            timeout_secs  = excluded.timeout_secs,
+            expect_status = excluded.expect_status,
+            expect_body   = excluded.expect_body,
+            enabled       = excluded.enabled,
+            updated_at    = excluded.updated_at
+        "#,
+    )
+    .bind(agent_id)
+    .bind(name)
+    .bind(kind)
+    .bind(target)
+    .bind(interval_secs)
+    .bind(timeout_secs)
+    .bind(expect_status)
+    .bind(expect_body)
+    .bind(if enabled { 1 } else { 0 })
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM health_probes WHERE agent_id = ?1 AND name = ?2",
+    )
+    .bind(agent_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn delete_health_probe(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    // Return (agent_id, name) of the deleted row so the caller can
+    // re-push the new probe set to the affected agent.
+    let row: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        "SELECT agent_id, name FROM health_probes WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    if row.is_some() {
+        sqlx::query("DELETE FROM health_probes WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(row)
+}
+
+pub async fn record_health_probe_result(
+    pool: &SqlitePool,
+    id: i64,
+    last_run_at: i64,
+    last_state: &str,
+    last_latency_ms: i64,
+    last_detail: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE health_probes
+           SET last_run_at = ?2,
+               last_state = ?3,
+               last_latency_ms = ?4,
+               last_detail = ?5
+         WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(last_run_at)
+    .bind(last_state)
+    .bind(last_latency_ms)
+    .bind(last_detail)
     .execute(pool)
     .await?;
     Ok(())

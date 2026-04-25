@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod device_auth;
+mod health;
 mod tokens;
 mod update_windows;
 
@@ -166,6 +167,7 @@ async fn main() {
         .nest("/device", device_auth::routes())
         .nest("/tokens", tokens::routes())
         .nest("/update-windows", update_windows::routes())
+        .nest("/health-probes", health::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
@@ -337,9 +339,61 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                     let _ = tx.send(Message::RegisterAck { agent_id: id.clone() });
 
                     broadcast_agent_list(&state).await;
+
+                    // Push the agent's current probe set so it picks
+                    // up any rules added while it was offline.
+                    health::push_to_agent(&state, &id).await;
                 }
                 other => {
                     if let Some(agent_id) = &agent_id_opt {
+                        // Health probe reports — persist last_* fields
+                        // and audit on green→red / red→green transitions.
+                        if let Message::HealthProbeReport { results } = &other {
+                            for r in results {
+                                let Ok(probe_id) = r.id.parse::<i64>() else {
+                                    continue;
+                                };
+                                let state_str = match r.state {
+                                    shared::HealthProbeState::Green => "green",
+                                    shared::HealthProbeState::Red => "red",
+                                };
+                                // Look up prior state for transition
+                                // detection before overwriting.
+                                let prev: Option<String> = sqlx::query_scalar(
+                                    "SELECT last_state FROM health_probes WHERE id = ?",
+                                )
+                                .bind(probe_id)
+                                .fetch_optional(&state.db)
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Err(e) = db::record_health_probe_result(
+                                    &state.db,
+                                    probe_id,
+                                    r.at,
+                                    state_str,
+                                    r.latency_ms as i64,
+                                    &r.detail,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(error = %e, "failed to persist health probe result");
+                                }
+                                let prev_str = prev.as_deref();
+                                if prev_str != Some(state_str) {
+                                    db::record_audit(
+                                        &state.db,
+                                        now_unix(),
+                                        Some("health"),
+                                        Some(agent_id),
+                                        &format!("health_probe.{state_str}"),
+                                        matches!(r.state, shared::HealthProbeState::Green),
+                                        Some(&format!("id={} {}", probe_id, r.detail)),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                         // Auto-update window bookkeeping: if a scheduled
                         // (or run-now) upgrade is in flight for this
                         // agent, attribute the AptUpgradeResponse to it.
