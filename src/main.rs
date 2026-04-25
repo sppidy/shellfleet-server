@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod device_auth;
+mod fan_out;
 mod health;
 mod tokens;
 mod update_windows;
@@ -168,6 +169,7 @@ async fn main() {
         .nest("/tokens", tokens::routes())
         .nest("/update-windows", update_windows::routes())
         .nest("/health-probes", health::routes())
+        .nest("/fan-out", fan_out::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
@@ -394,6 +396,11 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                                 }
                             }
                         }
+                        // Fan-out attribution: if a fan_out_run is
+                        // pending for (agent_id, kind), stamp it with
+                        // the result.
+                        fan_out::maybe_attribute_response(&state, agent_id, &other).await;
+
                         // Auto-update window bookkeeping: if a scheduled
                         // (or run-now) upgrade is in flight for this
                         // agent, attribute the AptUpgradeResponse to it.

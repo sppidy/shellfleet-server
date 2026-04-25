@@ -141,6 +141,37 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fan_out_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            started_at INTEGER NOT NULL,
+            actor TEXT
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fan_out_results (
+            run_id INTEGER NOT NULL,
+            agent_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT,
+            finished_at INTEGER,
+            PRIMARY KEY (run_id, agent_id)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS fan_out_runs_started ON fan_out_runs(started_at DESC);")
+        .execute(&pool)
+        .await?;
+
     migrate_legacy_tokens(&pool).await?;
 
     Ok(pool)
@@ -642,6 +673,126 @@ pub async fn record_health_probe_result(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct FanOutRunRow {
+    pub id: i64,
+    pub kind: String,
+    pub payload: Option<String>,
+    pub started_at: i64,
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct FanOutResultRow {
+    pub run_id: i64,
+    pub agent_id: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub finished_at: Option<i64>,
+}
+
+pub async fn create_fan_out_run(
+    pool: &SqlitePool,
+    kind: &str,
+    payload: Option<&str>,
+    started_at: i64,
+    actor: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO fan_out_runs (kind, payload, started_at, actor) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(kind)
+    .bind(payload)
+    .bind(started_at)
+    .bind(actor)
+    .execute(pool)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
+pub async fn upsert_fan_out_result(
+    pool: &SqlitePool,
+    run_id: i64,
+    agent_id: &str,
+    status: &str,
+    detail: Option<&str>,
+    finished_at: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO fan_out_results (run_id, agent_id, status, detail, finished_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(run_id, agent_id) DO UPDATE SET
+            status = excluded.status,
+            detail = excluded.detail,
+            finished_at = excluded.finished_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(agent_id)
+    .bind(status)
+    .bind(detail)
+    .bind(finished_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_fan_out_runs(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<FanOutRunRow>, sqlx::Error> {
+    sqlx::query_as::<_, FanOutRunRow>(
+        "SELECT id, kind, payload, started_at, actor FROM fan_out_runs \
+         ORDER BY started_at DESC, id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_fan_out_run(
+    pool: &SqlitePool,
+    run_id: i64,
+) -> Result<Option<FanOutRunRow>, sqlx::Error> {
+    sqlx::query_as::<_, FanOutRunRow>(
+        "SELECT id, kind, payload, started_at, actor FROM fan_out_runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_fan_out_results(
+    pool: &SqlitePool,
+    run_id: i64,
+) -> Result<Vec<FanOutResultRow>, sqlx::Error> {
+    sqlx::query_as::<_, FanOutResultRow>(
+        "SELECT run_id, agent_id, status, detail, finished_at \
+         FROM fan_out_results WHERE run_id = ? ORDER BY agent_id",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn pending_fan_out_for_agent(
+    pool: &SqlitePool,
+    agent_id: &str,
+    kind: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT r.run_id FROM fan_out_results r \
+         JOIN fan_out_runs f ON f.id = r.run_id \
+         WHERE r.agent_id = ?1 AND f.kind = ?2 AND r.status = 'pending' \
+         ORDER BY f.started_at ASC LIMIT 1",
+    )
+    .bind(agent_id)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn recent_audit(pool: &SqlitePool, limit: i64) -> Result<Vec<AuditRow>, sqlx::Error> {
