@@ -260,7 +260,25 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
         }
     });
 
-    while let Some(Ok(frame)) = receiver.next().await {
+    // Read timeout — if neither a real message nor a Pong reply arrives in
+    // 75s the TCP connection is dead and we should reap the agent. Without
+    // this the receiver loop can hang forever when Cloudflare/the kernel
+    // drops the socket without delivering an error.
+    let read_timeout = std::time::Duration::from_secs(75);
+    loop {
+        let next = tokio::time::timeout(read_timeout, receiver.next()).await;
+        let frame = match next {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => {
+                tracing::info!(error = %e, "agent ws receive error, closing");
+                break;
+            }
+            Ok(None) => break, // peer closed
+            Err(_) => {
+                tracing::warn!("agent ws idle for {read_timeout:?}, closing");
+                break;
+            }
+        };
         let text = match frame {
             WsMessage::Text(t) => t,
             WsMessage::Close(_) => break,
@@ -359,7 +377,17 @@ async fn handle_ui_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    while let Some(Ok(frame)) = receiver.next().await {
+    let read_timeout = std::time::Duration::from_secs(75);
+    loop {
+        let next = tokio::time::timeout(read_timeout, receiver.next()).await;
+        let frame = match next {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(client_id, "ui ws idle for {read_timeout:?}, closing");
+                break;
+            }
+        };
         let text = match frame {
             WsMessage::Text(t) => t,
             WsMessage::Close(_) => break,
