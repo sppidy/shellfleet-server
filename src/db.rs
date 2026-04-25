@@ -130,12 +130,16 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
             last_latency_ms INTEGER,
             last_detail TEXT,
             updated_at INTEGER NOT NULL DEFAULT 0,
+            env_json TEXT NOT NULL DEFAULT '[]',
             UNIQUE(agent_id, name)
         );
         "#,
     )
     .execute(&pool)
     .await?;
+    let _ = sqlx::query("ALTER TABLE health_probes ADD COLUMN env_json TEXT NOT NULL DEFAULT '[]'")
+        .execute(&pool)
+        .await;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS health_probes_agent ON health_probes(agent_id);")
         .execute(&pool)
@@ -613,6 +617,7 @@ pub struct HealthProbeRow {
     pub last_latency_ms: Option<i64>,
     pub last_detail: Option<String>,
     pub updated_at: i64,
+    pub env_json: String,
 }
 
 pub async fn list_health_probes(
@@ -621,7 +626,7 @@ pub async fn list_health_probes(
     sqlx::query_as::<_, HealthProbeRow>(
         "SELECT id, agent_id, name, kind, target, interval_secs, timeout_secs, \
          expect_status, expect_body, enabled, last_run_at, last_state, \
-         last_latency_ms, last_detail, updated_at \
+         last_latency_ms, last_detail, updated_at, env_json \
          FROM health_probes ORDER BY agent_id, name",
     )
     .fetch_all(pool)
@@ -635,7 +640,7 @@ pub async fn list_health_probes_for(
     sqlx::query_as::<_, HealthProbeRow>(
         "SELECT id, agent_id, name, kind, target, interval_secs, timeout_secs, \
          expect_status, expect_body, enabled, last_run_at, last_state, \
-         last_latency_ms, last_detail, updated_at \
+         last_latency_ms, last_detail, updated_at, env_json \
          FROM health_probes WHERE agent_id = ? ORDER BY name",
     )
     .bind(agent_id)
@@ -654,15 +659,16 @@ pub async fn upsert_health_probe(
     expect_status: Option<i64>,
     expect_body: Option<&str>,
     enabled: bool,
+    env_json: &str,
     now: i64,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO health_probes (
             agent_id, name, kind, target, interval_secs, timeout_secs,
-            expect_status, expect_body, enabled, updated_at
+            expect_status, expect_body, enabled, env_json, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ON CONFLICT(agent_id, name) DO UPDATE SET
             kind          = excluded.kind,
             target        = excluded.target,
@@ -671,6 +677,7 @@ pub async fn upsert_health_probe(
             expect_status = excluded.expect_status,
             expect_body   = excluded.expect_body,
             enabled       = excluded.enabled,
+            env_json      = excluded.env_json,
             updated_at    = excluded.updated_at
         "#,
     )
@@ -683,6 +690,7 @@ pub async fn upsert_health_probe(
     .bind(expect_status)
     .bind(expect_body)
     .bind(if enabled { 1 } else { 0 })
+    .bind(env_json)
     .bind(now)
     .execute(pool)
     .await?;

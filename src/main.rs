@@ -7,6 +7,7 @@ mod fan_out;
 mod health;
 mod labels;
 mod notifications;
+mod probe_library;
 mod tokens;
 mod update_windows;
 mod webhook;
@@ -226,6 +227,7 @@ async fn main() {
         api_routes = api_routes.nest("/backups", backups::routes());
     }
     let api_routes = api_routes
+        .nest("/probe-library", probe_library::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))

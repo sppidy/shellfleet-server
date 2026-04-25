@@ -40,9 +40,11 @@ struct ProbeOut {
     last_latency_ms: Option<i64>,
     last_detail: Option<String>,
     updated_at: i64,
+    env: Vec<String>,
 }
 
 fn to_out(row: db::HealthProbeRow) -> ProbeOut {
+    let env: Vec<String> = serde_json::from_str(&row.env_json).unwrap_or_default();
     ProbeOut {
         id: row.id,
         agent_id: row.agent_id,
@@ -59,6 +61,7 @@ fn to_out(row: db::HealthProbeRow) -> ProbeOut {
         last_latency_ms: row.last_latency_ms,
         last_detail: row.last_detail,
         updated_at: row.updated_at,
+        env,
     }
 }
 
@@ -79,6 +82,9 @@ struct UpsertBody {
     expect_body: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+    /// Optional `KEY=VALUE` strings passed to exec probes.
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 fn default_interval() -> i64 {
@@ -113,6 +119,7 @@ fn parse_kind(s: &str) -> Option<HealthProbeKind> {
 }
 
 fn row_to_spec(row: &db::HealthProbeRow) -> Option<HealthProbeSpec> {
+    let env: Vec<String> = serde_json::from_str(&row.env_json).unwrap_or_default();
     Some(HealthProbeSpec {
         id: row.id.to_string(),
         name: row.name.clone(),
@@ -122,6 +129,7 @@ fn row_to_spec(row: &db::HealthProbeRow) -> Option<HealthProbeSpec> {
         timeout_secs: row.timeout_secs.max(1) as u32,
         expect_status: row.expect_status.map(|n| n as u16),
         expect_body: row.expect_body.clone(),
+        env,
     })
 }
 
@@ -183,6 +191,7 @@ async fn upsert_handler(
         return (StatusCode::BAD_REQUEST, "target required").into_response();
     }
     let now = crate::now_unix();
+    let env_json = serde_json::to_string(&body.env).unwrap_or_else(|_| "[]".to_string());
     let id = match db::upsert_health_probe(
         &state.db,
         &body.agent_id,
@@ -194,6 +203,7 @@ async fn upsert_handler(
         body.expect_status,
         body.expect_body.as_deref(),
         body.enabled,
+        &env_json,
         now,
     )
     .await
