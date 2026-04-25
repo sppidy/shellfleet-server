@@ -34,7 +34,13 @@ struct TokenRow {
 
 #[derive(Deserialize)]
 struct RevokeRequest {
-    token: String,
+    /// Full token string. Takes priority over `hostname` if both are sent.
+    #[serde(default)]
+    token: Option<String>,
+    /// Hostname previously announced by an agent. Useful from the dashboard
+    /// where the operator only sees the token preview.
+    #[serde(default)]
+    hostname: Option<String>,
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -92,25 +98,46 @@ async fn revoke_token(
     if !require_auth(&jar) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
+    if req.token.is_none() && req.hostname.is_none() {
+        return (StatusCode::BAD_REQUEST, "Provide either token or hostname").into_response();
+    }
+
     let removed = {
         let mut tokens = state.approved_tokens.write().await;
-        tokens.remove(&req.token).is_some()
+        if let Some(token) = req.token.as_ref() {
+            tokens.remove(token).is_some()
+        } else if let Some(hostname) = req.hostname.as_ref() {
+            // Match exactly. Multiple tokens for the same hostname can
+            // legitimately exist (e.g. after a re-pair) — drop them all so
+            // a stale token can't quietly outlive a "revoke" click.
+            let to_remove: Vec<String> = tokens
+                .iter()
+                .filter(|(_, info)| info.hostname.as_deref() == Some(hostname.as_str()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let count = to_remove.len();
+            for k in to_remove {
+                tokens.remove(&k);
+            }
+            count > 0
+        } else {
+            false
+        }
     };
+
     if removed {
         let snapshot = state.approved_tokens.read().await.clone();
         if let Err(e) = crate::save_tokens(&snapshot) {
             tracing::error!(error = %e, "failed to persist tokens after revoke");
         }
-
-        // Best-effort: kick any agent that's currently using this token.
-        // We don't know which agent_id maps to which token without scanning
-        // hostnames, so we just rely on the WS write failing on the next
-        // message; the agent process will exit and systemd will restart it
-        // and hit the now-empty pairing flow.
-        tracing::info!("token revoked");
+        tracing::info!(
+            token = ?req.token.as_deref().map(preview),
+            hostname = ?req.hostname,
+            "token revoked"
+        );
         return (StatusCode::OK, "Revoked").into_response();
     }
-    (StatusCode::NOT_FOUND, "Unknown token").into_response()
+    (StatusCode::NOT_FOUND, "No matching token").into_response()
 }
 
 pub fn now_unix() -> u64 {
