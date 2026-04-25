@@ -85,6 +85,31 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// Whether the optional in-tree backup machinery is enabled. Off by
+/// default — most operators back up at the hypervisor / VM level
+/// (Proxmox, vSphere, etc.) and don't want a redundant in-VM tar.
+/// Toggle via `BACKUPS_ENABLED=true` in the docker host's `.env`.
+fn backups_enabled() -> bool {
+    matches!(
+        std::env::var("BACKUPS_ENABLED")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[derive(Serialize)]
+struct FeaturesResponse {
+    backups_enabled: bool,
+}
+
+async fn features_handler() -> impl IntoResponse {
+    axum::Json(FeaturesResponse {
+        backups_enabled: backups_enabled(),
+    })
+}
+
 #[derive(Serialize)]
 struct MeResponse {
     user: String,
@@ -182,20 +207,29 @@ async fn main() {
     });
 
     update_windows::spawn_scheduler(state.clone());
-    backups::spawn_scheduler(state.clone());
+    if backups_enabled() {
+        backups::spawn_scheduler(state.clone());
+        tracing::info!("backups: enabled (BACKUPS_ENABLED is set)");
+    } else {
+        tracing::info!("backups: disabled (set BACKUPS_ENABLED=true to enable)");
+    }
 
-    let api_routes = Router::new()
+    let mut api_routes = Router::new()
         .nest("/device", device_auth::routes())
         .nest("/tokens", tokens::routes())
         .nest("/update-windows", update_windows::routes())
         .nest("/health-probes", health::routes())
         .nest("/fan-out", fan_out::routes())
         .nest("/notifications", notifications::routes())
-        .nest("/backups", backups::routes())
-        .nest("/agent-labels", labels::routes())
+        .nest("/agent-labels", labels::routes());
+    if backups_enabled() {
+        api_routes = api_routes.nest("/backups", backups::routes());
+    }
+    let api_routes = api_routes
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
+        .route("/features", get(features_handler))
         .layer(axum::middleware::from_fn(csrf::middleware))
         .with_state(state.clone());
 
