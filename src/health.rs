@@ -107,6 +107,7 @@ fn parse_kind(s: &str) -> Option<HealthProbeKind> {
     match s {
         "http" => Some(HealthProbeKind::Http),
         "tcp" => Some(HealthProbeKind::Tcp),
+        "exec" => Some(HealthProbeKind::Exec),
         _ => None,
     }
 }
@@ -173,7 +174,7 @@ async fn upsert_handler(
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     };
     if parse_kind(&body.kind).is_none() {
-        return (StatusCode::BAD_REQUEST, "kind must be http or tcp").into_response();
+        return (StatusCode::BAD_REQUEST, "kind must be http, tcp, or exec").into_response();
     }
     if body.name.is_empty() {
         return (StatusCode::BAD_REQUEST, "name required").into_response();
