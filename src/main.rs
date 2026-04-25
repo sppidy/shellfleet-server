@@ -123,6 +123,7 @@ async fn main() {
     let api_routes = Router::new()
         .nest("/device", device_auth::routes())
         .route("/me", get(me_handler))
+        .route("/healthz", get(healthz))
         .with_state(state.clone());
 
     let ws_routes = Router::new()
@@ -131,6 +132,7 @@ async fn main() {
         .with_state(state);
 
     let app = Router::new()
+        // Internal healthcheck (used by Docker). Not exposed via nginx.
         .route("/healthz", get(healthz))
         .nest("/auth", auth::auth_routes())
         .nest("/api", api_routes)
