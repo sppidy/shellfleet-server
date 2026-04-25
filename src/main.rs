@@ -1,4 +1,5 @@
 mod auth;
+mod db;
 mod device_auth;
 mod tokens;
 
@@ -13,86 +14,35 @@ use axum_extra::extract::cookie::CookieJar;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use shared::{Message, UiMessage};
+use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex};
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub use tokens::{now_unix, TokenInfo};
-
 type AgentTx = mpsc::UnboundedSender<Message>;
 type UiTx = mpsc::UnboundedSender<UiMessage>;
 
-pub struct PendingDevice {
-    pub device_code: String,
-    pub user_code: String,
-    pub expires_at: u64,
-    pub approved: bool,
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub struct AppState {
     pub agents: Mutex<HashMap<String, AgentTx>>,
     pub ui_clients: Mutex<HashMap<u64, UiTx>>,
     pub ui_id_counter: AtomicU64,
-    pub pending_devices: RwLock<HashMap<String, PendingDevice>>,
-    pub user_codes: RwLock<HashMap<String, String>>,
-    pub approved_tokens: RwLock<HashMap<String, TokenInfo>>,
-}
-
-fn tokens_path() -> PathBuf {
-    PathBuf::from(
-        std::env::var("TOKENS_PATH").unwrap_or_else(|_| "/data/approved_tokens.json".to_string()),
-    )
-}
-
-pub fn save_tokens(tokens: &HashMap<String, TokenInfo>) -> std::io::Result<()> {
-    let path = tokens_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string(tokens)?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
-}
-
-pub fn load_tokens() -> HashMap<String, TokenInfo> {
-    let path = tokens_path();
-    let read_one = |p: &std::path::Path| -> Option<HashMap<String, TokenInfo>> {
-        let data = std::fs::read_to_string(p).ok()?;
-        if let Ok(parsed) = serde_json::from_str::<HashMap<String, TokenInfo>>(&data) {
-            return Some(parsed);
-        }
-        // Legacy schema: HashMap<String, bool>. Migrate.
-        if let Ok(legacy) = serde_json::from_str::<HashMap<String, bool>>(&data) {
-            tracing::info!("migrating legacy bool token store at {}", p.display());
-            return Some(
-                legacy
-                    .into_iter()
-                    .map(|(k, _)| (k, TokenInfo::default()))
-                    .collect(),
-            );
-        }
-        None
-    };
-
-    if let Some(t) = read_one(&path) {
-        return t;
-    }
-    if let Some(t) = read_one(std::path::Path::new("approved_tokens.json")) {
-        let _ = save_tokens(&t);
-        return t;
-    }
-    HashMap::new()
+    pub db: SqlitePool,
 }
 
 #[derive(Deserialize)]
@@ -142,13 +92,36 @@ fn init_tracing() {
 async fn main() {
     init_tracing();
 
+    let pool = match db::init().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to initialise sqlite");
+            std::process::exit(1);
+        }
+    };
+
+    // GC expired pending device-auth requests every minute so we don't
+    // accumulate stale rows.
+    {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                if let Ok(removed) = db::purge_expired_devices(&pool, now_unix()).await {
+                    if removed > 0 {
+                        tracing::debug!(%removed, "purged expired pending device-auth rows");
+                    }
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         agents: Mutex::new(HashMap::new()),
         ui_clients: Mutex::new(HashMap::new()),
         ui_id_counter: AtomicU64::new(0),
-        pending_devices: RwLock::new(HashMap::new()),
-        user_codes: RwLock::new(HashMap::new()),
-        approved_tokens: RwLock::new(load_tokens()),
+        db: pool,
     });
 
     let api_routes = Router::new()
@@ -186,7 +159,7 @@ async fn agent_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let is_approved = state.approved_tokens.read().await.contains_key(&auth.token);
+    let is_approved = db::token_exists(&state.db, &auth.token).await;
 
     let legacy_token = std::env::var("AGENT_SECRET").unwrap_or_default();
     let legacy_match = !legacy_token.is_empty() && auth.token == legacy_token;
@@ -297,20 +270,29 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                     state.agents.lock().await.insert(id.clone(), tx.clone());
                     tracing::info!(agent_id = %id, %protocol_version, "agent registered");
 
-                    // Touch the token's last_seen + hostname so the operator
-                    // can identify which agent owns each row in /api/tokens.
-                    let mut tokens = state.approved_tokens.write().await;
-                    let info = tokens.entry(token.clone()).or_default();
-                    info.hostname = Some(hostname.clone());
-                    info.last_seen = now_unix();
-                    if info.created_at == 0 {
-                        info.created_at = now_unix();
-                    }
-                    let snapshot = tokens.clone();
-                    drop(tokens);
-                    if let Err(e) = save_tokens(&snapshot) {
+                    // Stamp the token's hostname + last_seen (and seed
+                    // created_at on first contact) for the operator UI.
+                    if let Err(e) = db::upsert_token_seen(
+                        &state.db,
+                        &token,
+                        &hostname,
+                        now_unix(),
+                    )
+                    .await
+                    {
                         tracing::warn!(error = %e, "failed to persist token metadata");
                     }
+
+                    db::record_audit(
+                        &state.db,
+                        now_unix(),
+                        None,
+                        Some(&id),
+                        "agent.register",
+                        true,
+                        Some(&format!("protocol_version={protocol_version}")),
+                    )
+                    .await;
 
                     let _ = tx.send(Message::RegisterAck { agent_id: id.clone() });
 

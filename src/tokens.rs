@@ -2,34 +2,15 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{g
 use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{auth::verify_token, AppState};
-
-/// Per-token metadata persisted alongside the token itself. The previous
-/// schema stored `bool`; load_tokens still accepts that for migration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TokenInfo {
-    /// Unix seconds of approval. 0 for legacy tokens migrated from the
-    /// boolean schema.
-    #[serde(default)]
-    pub created_at: u64,
-    /// Hostname reported by the agent the last time it registered. Filled
-    /// in by handle_agent_socket so the operator can identify which entry
-    /// corresponds to which host when revoking.
-    #[serde(default)]
-    pub hostname: Option<String>,
-    /// Unix seconds of the last successful WebSocket handshake.
-    #[serde(default)]
-    pub last_seen: u64,
-}
+use crate::{auth::verify_token, db, AppState};
 
 #[derive(Serialize)]
 struct TokenRow {
     token_preview: String,
     hostname: Option<String>,
-    created_at: u64,
-    last_seen: u64,
+    created_at: i64,
+    last_seen: i64,
 }
 
 #[derive(Deserialize)]
@@ -49,13 +30,16 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/revoke", post(revoke_token))
 }
 
-fn require_auth(jar: &CookieJar) -> bool {
+fn require_auth(jar: &CookieJar) -> Option<String> {
     if std::env::var("JWT_SECRET").unwrap_or_default() == "dev" {
-        return true;
+        return Some("dev".to_string());
     }
-    jar.get("auth_token")
-        .map(|c| verify_token(c.value()))
-        .unwrap_or(false)
+    let cookie = jar.get("auth_token")?;
+    if verify_token(cookie.value()) {
+        crate::auth::user_from_token(cookie.value())
+    } else {
+        None
+    }
 }
 
 fn preview(token: &str) -> String {
@@ -69,25 +53,26 @@ fn preview(token: &str) -> String {
 }
 
 async fn list_tokens(jar: CookieJar, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if !require_auth(&jar) {
+    if require_auth(&jar).is_none() {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
-    let tokens = state.approved_tokens.read().await;
-    let mut rows: Vec<TokenRow> = tokens
-        .iter()
-        .map(|(token, info)| TokenRow {
-            token_preview: preview(token),
-            hostname: info.hostname.clone(),
-            created_at: info.created_at,
-            last_seen: info.last_seen,
+    let rows = match db::list_tokens(&state.db).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to list tokens");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        }
+    };
+    let out: Vec<TokenRow> = rows
+        .into_iter()
+        .map(|r| TokenRow {
+            token_preview: preview(&r.token),
+            hostname: r.hostname,
+            created_at: r.created_at,
+            last_seen: r.last_seen,
         })
         .collect();
-    rows.sort_by(|a, b| {
-        b.last_seen
-            .cmp(&a.last_seen)
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
-    Json(rows).into_response()
+    Json(out).into_response()
 }
 
 async fn revoke_token(
@@ -95,54 +80,56 @@ async fn revoke_token(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RevokeRequest>,
 ) -> impl IntoResponse {
-    if !require_auth(&jar) {
+    let Some(actor) = require_auth(&jar) else {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-    }
+    };
     if req.token.is_none() && req.hostname.is_none() {
         return (StatusCode::BAD_REQUEST, "Provide either token or hostname").into_response();
     }
 
-    let removed = {
-        let mut tokens = state.approved_tokens.write().await;
-        if let Some(token) = req.token.as_ref() {
-            tokens.remove(token).is_some()
-        } else if let Some(hostname) = req.hostname.as_ref() {
-            // Match exactly. Multiple tokens for the same hostname can
-            // legitimately exist (e.g. after a re-pair) — drop them all so
-            // a stale token can't quietly outlive a "revoke" click.
-            let to_remove: Vec<String> = tokens
-                .iter()
-                .filter(|(_, info)| info.hostname.as_deref() == Some(hostname.as_str()))
-                .map(|(k, _)| k.clone())
-                .collect();
-            let count = to_remove.len();
-            for k in to_remove {
-                tokens.remove(&k);
+    let removed_any = if let Some(t) = req.token.as_ref() {
+        match db::revoke_token(&state.db, t).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "revoke by token failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
             }
-            count > 0
-        } else {
-            false
         }
+    } else if let Some(h) = req.hostname.as_ref() {
+        match db::revoke_by_hostname(&state.db, h).await {
+            Ok(n) => n > 0,
+            Err(e) => {
+                tracing::error!(error = %e, "revoke by hostname failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+            }
+        }
+    } else {
+        false
     };
 
-    if removed {
-        let snapshot = state.approved_tokens.read().await.clone();
-        if let Err(e) = crate::save_tokens(&snapshot) {
-            tracing::error!(error = %e, "failed to persist tokens after revoke");
-        }
+    if removed_any {
         tracing::info!(
             token = ?req.token.as_deref().map(preview),
             hostname = ?req.hostname,
-            "token revoked"
+            actor = %actor,
+            "token revoked",
         );
+        let detail = match (&req.token, &req.hostname) {
+            (Some(t), _) => format!("token={}", preview(t)),
+            (_, Some(h)) => format!("hostname={h}"),
+            _ => String::new(),
+        };
+        db::record_audit(
+            &state.db,
+            crate::now_unix(),
+            Some(&actor),
+            req.hostname.as_deref(),
+            "token.revoke",
+            true,
+            Some(&detail),
+        )
+        .await;
         return (StatusCode::OK, "Revoked").into_response();
     }
     (StatusCode::NOT_FOUND, "No matching token").into_response()
-}
-
-pub fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

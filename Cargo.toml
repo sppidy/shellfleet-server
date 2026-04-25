@@ -18,3 +18,9 @@ tower-http = { version = "0.6.8", features = ["fs", "cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 urlencoding = "2.1.3"
+
+# sqlx for the persistent token / pending-device / audit store. The
+# `bundled` libsqlite3-sys feature compiles sqlite into the binary so
+# we don't need a runtime apt dependency.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }

@@ -8,9 +8,9 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::sync::Arc;
 
-use crate::{AppState, auth::verify_token};
+use crate::{auth::verify_token, db, AppState};
 
 #[derive(Serialize)]
 pub struct DeviceAuthResponse {
@@ -48,32 +48,20 @@ pub fn routes() -> Router<Arc<AppState>> {
 async fn request_device_auth(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let (device_code, user_code) = {
         let mut rng = rand::thread_rng();
-        
-        // Generate codes
         let d_code: String = (&mut rng).sample_iter(&Alphanumeric).take(32).map(char::from).collect();
-        
-        // User code usually easy to read, e.g. 8 uppercase letters split by dash
         let raw_user_code: String = (&mut rng).sample_iter(&Alphanumeric).take(8).map(char::from).collect();
         let u_code = format!("{}-{}", &raw_user_code[0..4], &raw_user_code[4..8]).to_uppercase();
-        
         (d_code, u_code)
     };
 
     let expires_in = 300; // 5 minutes
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() + expires_in;
+    let expires_at = crate::now_unix() + expires_in as i64;
 
-    let pending = crate::PendingDevice {
-        device_code: device_code.clone(),
-        user_code: user_code.clone(),
-        expires_at,
-        approved: false,
-    };
-
-    state.pending_devices.write().await.insert(device_code.clone(), pending);
-    state.user_codes.write().await.insert(user_code.clone(), device_code.clone());
+    if let Err(e) = db::insert_pending_device(&state.db, &device_code, &user_code, expires_at).await
+    {
+        tracing::error!(error = %e, "insert pending device failed");
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+    }
 
     let verification_uri = std::env::var("UI_URL").unwrap_or_else(|_| "https://dashboard.example.com/".to_string()) + "device";
 
@@ -84,61 +72,75 @@ async fn request_device_auth(State(state): State<Arc<AppState>>) -> impl IntoRes
         expires_in,
         interval: 5,
     })
+    .into_response()
 }
 
 async fn poll_device_token(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<DeviceTokenRequest>,
 ) -> impl IntoResponse {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-    let mut pending_devices = state.pending_devices.write().await;
-    
-    if let Some(device) = pending_devices.get_mut(&payload.device_code) {
-        if now > device.expires_at {
-            // Expired
-            let uc = device.user_code.clone();
-            pending_devices.remove(&payload.device_code);
-            state.user_codes.write().await.remove(&uc);
-            return Json(DeviceTokenResponse::Error { error: "expired_token".to_string() });
+    let now = crate::now_unix();
+    let row = match db::pending_device(&state.db, &payload.device_code).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "pending_device lookup failed");
+            return Json(DeviceTokenResponse::Error { error: "server_error".to_string() })
+                .into_response();
         }
+    };
 
-        if device.approved {
-            // Generate permanent token
-            let token = {
-                let mut rng = rand::thread_rng();
-                let t: String = (&mut rng).sample_iter(&Alphanumeric).take(64).map(char::from).collect();
-                t
-            };
-            
-            // Save token. hostname/last_seen get filled in when the agent
-            // actually registers; created_at is set here.
-            let info = crate::TokenInfo {
-                created_at: crate::now_unix(),
-                hostname: None,
-                last_seen: 0,
-            };
-            state.approved_tokens.write().await.insert(token.clone(), info);
-            let snapshot = state.approved_tokens.read().await.clone();
-            if let Err(e) = crate::save_tokens(&snapshot) {
-                tracing::warn!(error = %e, "failed to persist new approved token");
-            }
+    let Some(row) = row else {
+        return Json(DeviceTokenResponse::Error { error: "invalid_grant".to_string() })
+            .into_response();
+    };
 
-            // Cleanup pending
-            let uc = device.user_code.clone();
-            pending_devices.remove(&payload.device_code);
-            state.user_codes.write().await.remove(&uc);
-
-            return Json(DeviceTokenResponse::Token {
-                access_token: token,
-                token_type: "bearer".to_string(),
-            });
-        } else {
-            return Json(DeviceTokenResponse::Error { error: "authorization_pending".to_string() });
-        }
+    if now > row.expires_at {
+        let _ = db::delete_pending_device(&state.db, &row.device_code).await;
+        return Json(DeviceTokenResponse::Error { error: "expired_token".to_string() })
+            .into_response();
     }
 
-    Json(DeviceTokenResponse::Error { error: "invalid_grant".to_string() })
+    if row.approved == 0 {
+        return Json(DeviceTokenResponse::Error {
+            error: "authorization_pending".to_string(),
+        })
+        .into_response();
+    }
+
+    // Approved — mint a fresh access token, persist it, and clean up the
+    // pending row.
+    let token: String = {
+        let mut rng = rand::thread_rng();
+        (&mut rng)
+            .sample_iter(&Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect()
+    };
+
+    if let Err(e) = db::insert_token(&state.db, &token, now).await {
+        tracing::error!(error = %e, "insert token failed");
+        return Json(DeviceTokenResponse::Error { error: "server_error".to_string() })
+            .into_response();
+    }
+    let _ = db::delete_pending_device(&state.db, &row.device_code).await;
+
+    db::record_audit(
+        &state.db,
+        now,
+        None,
+        None,
+        "device.token.issued",
+        true,
+        Some(&format!("user_code={}", row.user_code)),
+    )
+    .await;
+
+    Json(DeviceTokenResponse::Token {
+        access_token: token,
+        token_type: "bearer".to_string(),
+    })
+    .into_response()
 }
 
 async fn approve_device(
@@ -146,34 +148,41 @@ async fn approve_device(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ApproveDeviceRequest>,
 ) -> impl IntoResponse {
-    // Authenticate Web UI User
-    let mut is_authenticated = false;
+    let mut actor: Option<String> = None;
     if std::env::var("JWT_SECRET").unwrap_or_default() == "dev" {
-        is_authenticated = true;
+        actor = Some("dev".to_string());
     } else if let Some(cookie) = jar.get("auth_token") {
         if verify_token(cookie.value()) {
-            is_authenticated = true;
+            actor = crate::auth::user_from_token(cookie.value());
         }
     }
-
-    if !is_authenticated {
+    if actor.is_none() {
         return (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
     let user_code = payload.user_code.to_uppercase();
-    
-    let device_code_opt = state.user_codes.read().await.get(&user_code).cloned();
-
-    if let Some(device_code) = device_code_opt {
-        let mut pending = state.pending_devices.write().await;
-        if let Some(device) = pending.get_mut(&device_code) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            if now <= device.expires_at {
-                device.approved = true;
-                return (axum::http::StatusCode::OK, "Approved").into_response();
-            }
+    let now = crate::now_unix();
+    let approved = match db::approve_user_code(&state.db, &user_code, now).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "approve_user_code failed");
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
         }
-    }
+    };
 
-    (axum::http::StatusCode::BAD_REQUEST, "Invalid or expired code").into_response()
+    if approved {
+        db::record_audit(
+            &state.db,
+            now,
+            actor.as_deref(),
+            None,
+            "device.approve",
+            true,
+            Some(&format!("user_code={user_code}")),
+        )
+        .await;
+        (axum::http::StatusCode::OK, "Approved").into_response()
+    } else {
+        (axum::http::StatusCode::BAD_REQUEST, "Invalid or expired code").into_response()
+    }
 }
