@@ -1,4 +1,5 @@
 mod auth;
+mod csrf;
 mod db;
 mod device_auth;
 mod fan_out;
@@ -173,6 +174,7 @@ async fn main() {
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
+        .layer(axum::middleware::from_fn(csrf::middleware))
         .with_state(state.clone());
 
     let ws_routes = Router::new()
