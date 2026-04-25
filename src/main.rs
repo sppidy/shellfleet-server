@@ -1,5 +1,6 @@
 mod auth;
 mod device_auth;
+mod tokens;
 
 use axum::{
     extract::{Query, State, ws::{Message as WsMessage, WebSocket, WebSocketUpgrade}},
@@ -22,6 +23,11 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+pub use tokens::{now_unix, TokenInfo};
 
 type AgentTx = mpsc::UnboundedSender<Message>;
 type UiTx = mpsc::UnboundedSender<UiMessage>;
@@ -39,7 +45,7 @@ pub struct AppState {
     pub ui_id_counter: AtomicU64,
     pub pending_devices: RwLock<HashMap<String, PendingDevice>>,
     pub user_codes: RwLock<HashMap<String, String>>,
-    pub approved_tokens: RwLock<HashMap<String, bool>>,
+    pub approved_tokens: RwLock<HashMap<String, TokenInfo>>,
 }
 
 fn tokens_path() -> PathBuf {
@@ -48,7 +54,7 @@ fn tokens_path() -> PathBuf {
     )
 }
 
-pub fn save_tokens(tokens: &HashMap<String, bool>) -> std::io::Result<()> {
+pub fn save_tokens(tokens: &HashMap<String, TokenInfo>) -> std::io::Result<()> {
     let path = tokens_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -59,19 +65,32 @@ pub fn save_tokens(tokens: &HashMap<String, bool>) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-pub fn load_tokens() -> HashMap<String, bool> {
+pub fn load_tokens() -> HashMap<String, TokenInfo> {
     let path = tokens_path();
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(tokens) = serde_json::from_str(&data) {
-            return tokens;
+    let read_one = |p: &std::path::Path| -> Option<HashMap<String, TokenInfo>> {
+        let data = std::fs::read_to_string(p).ok()?;
+        if let Ok(parsed) = serde_json::from_str::<HashMap<String, TokenInfo>>(&data) {
+            return Some(parsed);
         }
+        // Legacy schema: HashMap<String, bool>. Migrate.
+        if let Ok(legacy) = serde_json::from_str::<HashMap<String, bool>>(&data) {
+            tracing::info!("migrating legacy bool token store at {}", p.display());
+            return Some(
+                legacy
+                    .into_iter()
+                    .map(|(k, _)| (k, TokenInfo::default()))
+                    .collect(),
+            );
+        }
+        None
+    };
+
+    if let Some(t) = read_one(&path) {
+        return t;
     }
-    // Legacy fallback: tokens used to live next to the binary at ./approved_tokens.json
-    if let Ok(data) = std::fs::read_to_string("approved_tokens.json") {
-        if let Ok(tokens) = serde_json::from_str::<HashMap<String, bool>>(&data) {
-            let _ = save_tokens(&tokens);
-            return tokens;
-        }
+    if let Some(t) = read_one(std::path::Path::new("approved_tokens.json")) {
+        let _ = save_tokens(&t);
+        return t;
     }
     HashMap::new()
 }
@@ -109,8 +128,20 @@ async fn me_handler(jar: CookieJar) -> impl IntoResponse {
     (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
 }
 
+fn init_tracing() {
+    // RUST_LOG=info,server=debug,tower_http=info gives nice request logs.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,server=info,tower_http=info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false).with_level(true))
+        .init();
+}
+
 #[tokio::main]
 async fn main() {
+    init_tracing();
+
     let state = Arc::new(AppState {
         agents: Mutex::new(HashMap::new()),
         ui_clients: Mutex::new(HashMap::new()),
@@ -122,6 +153,7 @@ async fn main() {
 
     let api_routes = Router::new()
         .nest("/device", device_auth::routes())
+        .nest("/tokens", tokens::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .with_state(state.clone());
@@ -131,15 +163,19 @@ async fn main() {
         .route("/ui/ws", get(ui_ws_handler))
         .with_state(state);
 
+    let trace_layer = TraceLayer::new_for_http()
+        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_failure(DefaultOnFailure::new().level(Level::WARN));
+
     let app = Router::new()
-        // Internal healthcheck (used by Docker). Not exposed via nginx.
         .route("/healthz", get(healthz))
         .nest("/auth", auth::auth_routes())
         .nest("/api", api_routes)
-        .merge(ws_routes);
+        .merge(ws_routes)
+        .layer(trace_layer);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    println!("Server listening on {}", addr);
+    tracing::info!(%addr, "server listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -156,11 +192,11 @@ async fn agent_ws_handler(
     let legacy_match = !legacy_token.is_empty() && auth.token == legacy_token;
 
     if !legacy_match && !is_approved {
-        println!("Unauthorized agent connection attempt.");
+        tracing::warn!("unauthorized agent connection attempt");
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    ws.on_upgrade(|socket| handle_agent_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_agent_socket(socket, state, auth.token))
         .into_response()
 }
 
@@ -180,7 +216,7 @@ async fn ui_ws_handler(
     }
 
     if !is_authenticated {
-        println!("Unauthorized UI connection attempt.");
+        tracing::warn!("unauthorized ui connection attempt");
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -188,8 +224,8 @@ async fn ui_ws_handler(
         .into_response()
 }
 
-async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>) {
-    println!("New Agent WebSocket connection");
+async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: String) {
+    tracing::info!("new agent websocket connection");
     let (mut sender, mut receiver) = socket.split();
 
     let mut agent_id_opt: Option<String> = None;
@@ -208,12 +244,27 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>) {
     while let Some(Ok(WsMessage::Text(text))) = receiver.next().await {
         if let Ok(parsed_msg) = serde_json::from_str::<Message>(&text) {
             match parsed_msg {
-                Message::Register { hostname } => {
+                Message::Register { hostname, protocol_version } => {
                     let id = format!("{}-id", hostname);
                     agent_id_opt = Some(id.clone());
 
                     state.agents.lock().await.insert(id.clone(), tx.clone());
-                    println!("Agent registered: {}", id);
+                    tracing::info!(agent_id = %id, %protocol_version, "agent registered");
+
+                    // Touch the token's last_seen + hostname so the operator
+                    // can identify which agent owns each row in /api/tokens.
+                    let mut tokens = state.approved_tokens.write().await;
+                    let info = tokens.entry(token.clone()).or_default();
+                    info.hostname = Some(hostname.clone());
+                    info.last_seen = now_unix();
+                    if info.created_at == 0 {
+                        info.created_at = now_unix();
+                    }
+                    let snapshot = tokens.clone();
+                    drop(tokens);
+                    if let Err(e) = save_tokens(&snapshot) {
+                        tracing::warn!(error = %e, "failed to persist token metadata");
+                    }
 
                     let _ = tx.send(Message::RegisterAck { agent_id: id.clone() });
 
@@ -237,21 +288,19 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>) {
 
     if let Some(id) = agent_id_opt {
         state.agents.lock().await.remove(&id);
-        println!("Agent disconnected: {}", id);
+        tracing::info!(agent_id = %id, "agent disconnected");
         broadcast_agent_list(&state).await;
     }
 }
 
 async fn handle_ui_socket(socket: WebSocket, state: Arc<AppState>) {
-    println!("New UI WebSocket connection");
+    tracing::info!("new ui websocket connection");
     let (mut sender, mut receiver) = socket.split();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UiMessage>();
     let client_id = state.ui_id_counter.fetch_add(1, Ordering::Relaxed);
     state.ui_clients.lock().await.insert(client_id, tx.clone());
 
-    // Send the current agent list immediately so the UI can populate without
-    // having to ask. Subsequent updates come from broadcast_agent_list.
     {
         let agents: Vec<String> = state.agents.lock().await.keys().cloned().collect();
         let _ = tx.send(UiMessage::ListAgentsResponse { agents });
@@ -287,5 +336,5 @@ async fn handle_ui_socket(socket: WebSocket, state: Arc<AppState>) {
 
     send_task.abort();
     state.ui_clients.lock().await.remove(&client_id);
-    println!("UI client disconnected: {}", client_id);
+    tracing::info!(client_id, "ui client disconnected");
 }

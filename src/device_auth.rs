@@ -111,9 +111,18 @@ async fn poll_device_token(
                 t
             };
             
-            // Save token
-            state.approved_tokens.write().await.insert(token.clone(), true);
-            let _ = crate::save_tokens(&*state.approved_tokens.read().await);
+            // Save token. hostname/last_seen get filled in when the agent
+            // actually registers; created_at is set here.
+            let info = crate::TokenInfo {
+                created_at: crate::now_unix(),
+                hostname: None,
+                last_seen: 0,
+            };
+            state.approved_tokens.write().await.insert(token.clone(), info);
+            let snapshot = state.approved_tokens.read().await.clone();
+            if let Err(e) = crate::save_tokens(&snapshot) {
+                tracing::warn!(error = %e, "failed to persist new approved token");
+            }
 
             // Cleanup pending
             let uc = device.user_code.clone();
