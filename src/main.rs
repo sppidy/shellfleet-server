@@ -66,6 +66,36 @@ struct MeResponse {
     user: String,
 }
 
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn audit_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<AuditQuery>,
+) -> impl IntoResponse {
+    if std::env::var("JWT_SECRET").unwrap_or_default() != "dev" {
+        let cookie = match jar.get("auth_token") {
+            Some(c) => c,
+            None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+        };
+        if !auth::verify_token(cookie.value()) {
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    match db::recent_audit(&state.db, limit).await {
+        Ok(rows) => axum::Json(rows).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "audit query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
 async fn me_handler(jar: CookieJar) -> impl IntoResponse {
     if std::env::var("JWT_SECRET").unwrap_or_default() == "dev" {
         return (StatusCode::OK, axum::Json(MeResponse { user: "dev".into() })).into_response();
@@ -129,6 +159,7 @@ async fn main() {
         .nest("/tokens", tokens::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
+        .route("/audit", get(audit_handler))
         .with_state(state.clone());
 
     let ws_routes = Router::new()
