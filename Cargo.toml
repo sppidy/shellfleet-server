@@ -41,6 +41,9 @@ time = "0.3"
 # CIDR matching for trusted-proxy gating in throttle::real_client_ip.
 ipnet = "2.10"
 
+# Metrics-plugin config (CE Prometheus integration).
+serde_yaml = "0.9"
+
 # sqlx for the persistent token / pending-device / audit store. The
 # `bundled` libsqlite3-sys feature compiles sqlite into the binary so
 # we don't need a runtime apt dependency.

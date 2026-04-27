@@ -8,6 +8,7 @@ mod device_auth;
 mod fan_out;
 mod health;
 mod labels;
+mod metrics;
 mod mfa;
 mod notifications;
 mod probe_library;
@@ -324,6 +325,7 @@ async fn main() {
         .nest("/probe-library", probe_library::routes())
         .nest("/auth/mfa", mfa::routes())
         .nest("/users", users::routes())
+        .nest("/metrics", metrics::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
