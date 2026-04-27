@@ -890,6 +890,12 @@ fn is_mutating_agent_message(msg: &Message) -> bool {
         | JournalLogsStop { .. }
         | JournalStreamRequest { .. }
         | JournalStreamStop { .. }
+        // Stop is a control signal — the start (TerminalData / StartTerminal)
+        // is what's mutating-admin-only. Allowing viewers to close
+        // their own pane after an admin opened it would be ideal,
+        // but the closer matches the existing pattern of treating
+        // *Stop signals as read-only.
+        | StopTerminalRequest
         | SwarmServiceInspectRequest { .. }
         | BackupListArchivesRequest { .. }
         | DockerImageListRequest
