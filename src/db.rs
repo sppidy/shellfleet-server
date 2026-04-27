@@ -1309,3 +1309,88 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserListRow>, sqlx::Err
     .await
 }
 
+/// Outcome of `upsert_login_with_seat_check`. The OAuth callback uses
+/// this to distinguish "new seat consumed" (audit + welcome flow) from
+/// "existing user signing in" (just a `last_login_at` bump).
+pub enum SeatedUpsert {
+    /// The login already had a row; `last_login_at` was bumped.
+    Existing(UserRow),
+    /// A new row was created; this seat is now occupied.
+    Created(UserRow),
+    /// No row existed and the seat cap was at capacity.
+    SeatCapReached,
+}
+
+/// Transactional version of `upsert_login` that enforces the CE seat
+/// cap atomically. The previous "count then insert" sequence had a
+/// race where two concurrent first-time sign-ins could both pass the
+/// COUNT check before either committed. Wrapping the whole sequence
+/// in `BEGIN ... COMMIT` (with sqlite's default serialised-write
+/// model) closes that window.
+pub async fn upsert_login_with_seat_check(
+    pool: &SqlitePool,
+    login: &str,
+    default_role_if_new: &str,
+    now: i64,
+    seat_limit: i64,
+) -> Result<SeatedUpsert, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let existing: Option<UserRow> = sqlx::query_as::<_, UserRow>(
+        "SELECT login, role, totp_enabled, totp_secret, totp_recovery_hashes, \
+         created_at, last_login_at FROM users WHERE login = ?",
+    )
+    .bind(login)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(_) = existing.as_ref() {
+        sqlx::query("UPDATE users SET last_login_at = ?2 WHERE login = ?1")
+            .bind(login)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        let row: UserRow = sqlx::query_as::<_, UserRow>(
+            "SELECT login, role, totp_enabled, totp_secret, totp_recovery_hashes, \
+             created_at, last_login_at FROM users WHERE login = ?",
+        )
+        .bind(login)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(SeatedUpsert::Existing(row));
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= seat_limit {
+        // Roll back; nothing was written.
+        tx.rollback().await?;
+        return Ok(SeatedUpsert::SeatCapReached);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (login, role, created_at, last_login_at)
+        VALUES (?1, ?2, ?3, ?3)
+        "#,
+    )
+    .bind(login)
+    .bind(default_role_if_new)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let row: UserRow = sqlx::query_as::<_, UserRow>(
+        "SELECT login, role, totp_enabled, totp_secret, totp_recovery_hashes, \
+         created_at, last_login_at FROM users WHERE login = ?",
+    )
+    .bind(login)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(SeatedUpsert::Created(row))
+}
+

@@ -29,11 +29,20 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 
 use crate::AppState;
+
+const OAUTH_STATE_COOKIE: &str = "oauth_state";
+/// Pending-MFA tokens are short-lived. Anything past 10 min and the
+/// user has to re-OAuth — minimal annoyance, large blast-radius
+/// reduction if a pending-MFA cookie ever leaks.
+const MFA_PENDING_TTL_SECS: i64 = 600;
+const FULL_SESSION_TTL_SECS: i64 = 24 * 3600;
+const OAUTH_STATE_TTL_SECS: i64 = 600;
 
 #[derive(Debug, Deserialize)]
 pub struct AuthRequest {
@@ -126,25 +135,94 @@ fn cookie_secure() -> bool {
 }
 
 fn jwt_secret() -> String {
-    env::var("JWT_SECRET").unwrap_or_else(|_| "supersecretkey".to_string())
+    // Production safety: any non-`dev` value is fine; an unset value
+    // is fatal. `assert_jwt_secret_present` is called from `main`
+    // before the server starts listening, so this fallback string is
+    // only a defence-in-depth — control should never reach it.
+    env::var("JWT_SECRET").unwrap_or_else(|_| {
+        panic!(
+            "JWT_SECRET environment variable is not set. Refusing to sign tokens \
+             with a hard-coded default. Set JWT_SECRET=dev for local development \
+             or to a 64-char random hex string for production."
+        )
+    })
+}
+
+/// Called from `main` at startup. Aborts the process if JWT_SECRET is
+/// unset or trivially short (< 32 chars), unless we're in `dev` mode.
+pub fn assert_jwt_secret_present() {
+    let val = env::var("JWT_SECRET").unwrap_or_default();
+    if val.is_empty() {
+        eprintln!(
+            "FATAL: JWT_SECRET is not set. Refusing to start.\n\
+             Set JWT_SECRET=dev for local development or a 64+ char random \
+             hex string for production."
+        );
+        std::process::exit(2);
+    }
+    if val == "dev" {
+        tracing::warn!(
+            "JWT_SECRET=dev — auth, RBAC, MFA, and CSRF are all disabled. \
+             This is for local development only. Do not deploy this configuration."
+        );
+        return;
+    }
+    if val.len() < 32 {
+        eprintln!(
+            "FATAL: JWT_SECRET is {} chars; refusing to start with anything \
+             shorter than 32. Generate a fresh secret: \
+             `openssl rand -hex 32`.",
+            val.len()
+        );
+        std::process::exit(2);
+    }
+    if val == "supersecretkey" {
+        eprintln!(
+            "FATAL: JWT_SECRET is the historical placeholder \
+             'supersecretkey'. Refusing to start."
+        );
+        std::process::exit(2);
+    }
 }
 
 fn dev_mode() -> bool {
     env::var("JWT_SECRET").unwrap_or_default() == "dev"
 }
 
-async fn login_handler() -> impl IntoResponse {
+fn random_oauth_state() -> String {
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn login_handler(jar: CookieJar) -> impl IntoResponse {
     let client_id = env::var("GITHUB_CLIENT_ID").unwrap_or_else(|_| "dummy_id".to_string());
     let redirect_uri = env::var("OAUTH_REDIRECT_URL")
         .unwrap_or_else(|_| "https://dashboard.example.com/auth/callback".to_string());
 
+    // Random per-flow state cookie. The callback rejects any state
+    // value that doesn't match the cookie set here, defeating the
+    // classic OAuth CSRF where an attacker tricks a victim into hitting
+    // /auth/callback with the attacker's authorization code. Cookie is
+    // HttpOnly + SameSite=Lax + Secure so it travels back from GitHub
+    // unmodified but isn't readable from JS.
+    let state = random_oauth_state();
+    let cookie = Cookie::build((OAUTH_STATE_COOKIE, state.clone()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(cookie_secure())
+        .max_age(time::Duration::seconds(OAUTH_STATE_TTL_SECS))
+        .build();
+
     let redirect_url = format!(
-        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state=sysmanager&scope=read:user",
+        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=read:user",
         client_id,
-        urlencoding::encode(&redirect_uri)
+        urlencoding::encode(&redirect_uri),
+        urlencoding::encode(&state),
     );
 
-    Redirect::temporary(&redirect_url)
+    (jar.add(cookie), Redirect::temporary(&redirect_url)).into_response()
 }
 
 async fn logout_handler(jar: CookieJar) -> impl IntoResponse {
@@ -204,6 +282,27 @@ async fn callback_handler(
     Query(query): Query<AuthRequest>,
 ) -> Response {
     tracing::info!("github oauth callback");
+
+    // CSRF protection on the callback. The login_handler set
+    // `oauth_state` to a random 24-byte value; GitHub must echo it
+    // back via the `state` query param. Any mismatch (or missing
+    // cookie) is treated as a forgery attempt.
+    let cookie_state = jar.get(OAUTH_STATE_COOKIE).map(|c| c.value().to_string());
+    match &cookie_state {
+        Some(s) if s == &query.state => { /* ok */ }
+        _ => {
+            tracing::warn!(
+                got = %query.state,
+                expected = ?cookie_state,
+                "oauth state mismatch — rejecting callback"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "OAuth state mismatch — start the sign-in flow over.",
+            )
+                .into_response();
+        }
+    }
 
     let client_id = env::var("GITHUB_CLIENT_ID").unwrap_or_else(|_| "dummy_id".to_string());
     let client_secret =
@@ -272,61 +371,30 @@ async fn callback_handler(
             .into_response();
     }
 
-    // CE seat cap: a fresh sign-in (login not already in `users`) is
-    // rejected once `users` has reached `CE_USER_LIMIT` rows. Existing
-    // users always get through — the cap is on *adding seats*, not on
-    // sign-in volume. EE will lift this with a license-keyed cap.
-    let now = crate::now_unix();
-    let bootstrap_admin = env::var("BOOTSTRAP_ADMIN").ok();
-    let user_count = crate::db::count_users(&state.db).await.unwrap_or(0);
-    let already_seated = matches!(
-        crate::db::get_user(&state.db, &user_data.login).await,
-        Ok(Some(_))
-    );
-    if !already_seated && user_count >= crate::CE_USER_LIMIT as i64 {
-        tracing::warn!(
-            login = %user_data.login,
-            user_count,
-            limit = crate::CE_USER_LIMIT,
-            "rejecting new sign-in: CE seat cap reached"
-        );
-        crate::db::record_audit(
-            &state.db,
-            now,
-            Some(&user_data.login),
-            None,
-            "auth.login.seat_cap_reached",
-            false,
-            Some(&format!("limit={}", crate::CE_USER_LIMIT)),
-        )
-        .await;
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "This sys-manager Community Edition is at its {}-user seat cap. \
-                 Ask an existing admin to remove a seat at /admin, or upgrade to EE.",
-                crate::CE_USER_LIMIT
-            ),
-        )
-            .into_response();
-    }
-
     // CE bootstrap rule: if no users exist yet, the first allowlisted
     // login becomes admin. Subsequent allowlisted logins default to
     // viewer. An operator can also pin a specific login as the
     // bootstrap admin via BOOTSTRAP_ADMIN — useful when the allowlist
     // changes order or the first sign-in is mistakenly someone else.
+    //
+    // Seat-cap enforcement is now atomic: `upsert_login_with_seat_check`
+    // wraps the COUNT + INSERT in a single SQLite transaction so two
+    // concurrent first-time sign-ins can't both squeeze past the cap.
+    let now = crate::now_unix();
+    let bootstrap_admin = env::var("BOOTSTRAP_ADMIN").ok();
+    let user_count = crate::db::count_users(&state.db).await.unwrap_or(0);
     let default_role = if user_count == 0 || bootstrap_admin.as_deref() == Some(user_data.login.as_str()) {
         "admin"
     } else {
         "viewer"
     };
 
-    let user_row = match crate::db::upsert_login(
+    let upsert = match crate::db::upsert_login_with_seat_check(
         &state.db,
         &user_data.login,
         default_role,
         now,
+        crate::CE_USER_LIMIT as i64,
     )
     .await
     {
@@ -337,15 +405,45 @@ async fn callback_handler(
         }
     };
 
+    let user_row = match upsert {
+        crate::db::SeatedUpsert::Existing(r) | crate::db::SeatedUpsert::Created(r) => r,
+        crate::db::SeatedUpsert::SeatCapReached => {
+            tracing::warn!(
+                login = %user_data.login,
+                limit = crate::CE_USER_LIMIT,
+                "rejecting new sign-in: CE seat cap reached"
+            );
+            crate::db::record_audit(
+                &state.db,
+                now,
+                Some(&user_data.login),
+                None,
+                "auth.login.seat_cap_reached",
+                false,
+                Some(&format!("limit={}", crate::CE_USER_LIMIT)),
+            )
+            .await;
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "This sys-manager Community Edition is at its {}-user seat cap. \
+                     Ask an existing admin to remove a seat at /admin, or upgrade to EE.",
+                    crate::CE_USER_LIMIT
+                ),
+            )
+                .into_response();
+        }
+    };
+
     let role = Role::parse(&user_row.role);
     let mfa_required = user_row.totp_enabled != 0;
 
-    // Pending-MFA cookies expire after 10 minutes; full sessions get the
-    // historical 24h.
+    // Pending-MFA cookies expire after MFA_PENDING_TTL_SECS; full
+    // sessions get FULL_SESSION_TTL_SECS.
     let (mfa_verified, ttl, redirect_path) = if mfa_required {
-        (false, 600_i64, "mfa")
+        (false, MFA_PENDING_TTL_SECS, "mfa")
     } else {
-        (true, 24 * 3600_i64, "")
+        (true, FULL_SESSION_TTL_SECS, "")
     };
 
     let token = match issue_jwt(&user_data.login, role, mfa_verified, ttl) {
@@ -361,6 +459,15 @@ async fn callback_handler(
     let ui_url = env::var("UI_URL").unwrap_or_else(|_| "https://dashboard.example.com/".to_string());
     let dest = format!("{ui_url}{redirect_path}");
 
+    // Burn the OAuth state cookie now that we've consumed it.
+    let mut clear_state = Cookie::build((OAUTH_STATE_COOKIE, ""))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(cookie_secure())
+        .build();
+    clear_state.make_removal();
+
     crate::db::record_audit(
         &state.db,
         now,
@@ -372,7 +479,7 @@ async fn callback_handler(
     )
     .await;
 
-    (jar.add(cookie), Redirect::temporary(&dest)).into_response()
+    (jar.add(cookie).add(clear_state), Redirect::temporary(&dest)).into_response()
 }
 
 fn decode_claims(token: &str) -> Option<Claims> {

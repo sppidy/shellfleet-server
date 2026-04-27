@@ -156,12 +156,31 @@ async fn approve_device(
             actor = crate::auth::user_from_token(cookie.value());
         }
     }
-    if actor.is_none() {
+    let Some(actor) = actor else {
         return (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    };
+
+    let now = crate::now_unix();
+
+    // Brute-force defence on user_code (only ~36^8 ≈ 2.8e12 raw, but
+    // the operator-approved attack surface is one approve per
+    // 5-minute window per pending device — still cheap to guess
+    // without a throttle).
+    if let crate::throttle::CheckResult::Locked { retry_after_secs } =
+        state.device_approve_throttle.check(&actor, now)
+    {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )],
+            "too many failed attempts; try again later",
+        )
+            .into_response();
     }
 
     let user_code = payload.user_code.to_uppercase();
-    let now = crate::now_unix();
     let approved = match db::approve_user_code(&state.db, &user_code, now).await {
         Ok(b) => b,
         Err(e) => {
@@ -171,10 +190,11 @@ async fn approve_device(
     };
 
     if approved {
+        state.device_approve_throttle.record_success(&actor);
         db::record_audit(
             &state.db,
             now,
-            actor.as_deref(),
+            Some(&actor),
             None,
             "device.approve",
             true,
@@ -183,6 +203,17 @@ async fn approve_device(
         .await;
         (axum::http::StatusCode::OK, "Approved").into_response()
     } else {
+        state.device_approve_throttle.record_failure(&actor, now);
+        db::record_audit(
+            &state.db,
+            now,
+            Some(&actor),
+            None,
+            "device.approve.fail",
+            false,
+            None,
+        )
+        .await;
         (axum::http::StatusCode::BAD_REQUEST, "Invalid or expired code").into_response()
     }
 }

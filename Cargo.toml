@@ -31,6 +31,13 @@ sha1 = "0.10"
 sha2 = "0.10"
 data-encoding = "2.11"
 
+# Constant-time equality + AES-GCM at-rest encryption for TOTP secrets.
+subtle = "2.6"
+aes-gcm = "0.10"
+
+# Cookie max-age uses the cookie crate's `time::Duration`.
+time = "0.3"
+
 # sqlx for the persistent token / pending-device / audit store. The
 # `bundled` libsqlite3-sys feature compiles sqlite into the binary so
 # we don't need a runtime apt dependency.

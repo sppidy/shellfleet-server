@@ -1,5 +1,6 @@
 mod auth;
 mod backups;
+mod crypto;
 mod csrf;
 mod db;
 mod device_auth;
@@ -10,6 +11,8 @@ mod mfa;
 mod notifications;
 mod probe_library;
 mod rbac;
+mod security_headers;
+mod throttle;
 mod tokens;
 mod update_windows;
 mod users;
@@ -66,6 +69,13 @@ pub struct AppState {
     pub ui_clients: Mutex<HashMap<u64, UiTx>>,
     pub ui_id_counter: AtomicU64,
     pub db: SqlitePool,
+    /// Per-login throttle for /api/auth/mfa/verify failures. Defends
+    /// against an attacker who has stolen a pending-MFA cookie and is
+    /// brute-forcing the 6-digit TOTP space.
+    pub mfa_throttle: throttle::Throttle,
+    /// Per-IP throttle for /api/device/approve. The 8-char user_code
+    /// has only ~10^9 entropy and could otherwise be brute-forced.
+    pub device_approve_throttle: throttle::Throttle,
     /// agent_ids currently expecting an `AptUpgradeResponse` that should
     /// be attributed to the auto-update scheduler (or `run_now` button)
     /// rather than a UI-driven upgrade. Cleared when the response lands.
@@ -204,6 +214,11 @@ fn init_tracing() {
 async fn main() {
     init_tracing();
 
+    // Refuse to start with an obviously-bad JWT_SECRET. Catches the
+    // most common deployment footgun: a freshly cloned compose stanza
+    // launched without an `.env` override.
+    auth::assert_jwt_secret_present();
+
     let pool = match db::init().await {
         Ok(p) => p,
         Err(e) => {
@@ -229,15 +244,27 @@ async fn main() {
         });
     }
 
-    // CE: 7-day local audit retention. Runs hourly so a long-running
-    // server eventually drops old rows even without a restart. The
-    // retention window is intentionally fixed in CE — EE will expose
-    // it as a knob alongside the long-retention / SIEM-export sink.
+    // CE: 7-day local audit retention. Runs once at startup so a server
+    // that comes up after a long downtime drops stale rows immediately
+    // (rather than waiting an hour), then hourly thereafter.
     {
         let pool = pool.clone();
         tokio::spawn(async move {
             const RETENTION_SECS: i64 = 7 * 24 * 3600;
+            // Eager first sweep.
+            let cutoff = now_unix() - RETENTION_SECS;
+            match db::purge_audit_before(&pool, cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(%removed, %cutoff, "startup audit retention sweep");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "startup audit retention sweep failed");
+                }
+            }
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // drop the immediate first tick
             loop {
                 tick.tick().await;
                 let cutoff = now_unix() - RETENTION_SECS;
@@ -259,6 +286,8 @@ async fn main() {
         ui_clients: Mutex::new(HashMap::new()),
         ui_id_counter: AtomicU64::new(0),
         db: pool,
+        mfa_throttle: throttle::Throttle::new(),
+        device_approve_throttle: throttle::Throttle::new(),
         scheduled_apt_runs: Mutex::new(HashSet::new()),
         pending_backup_lists: Mutex::new(HashMap::new()),
         pending_backup_restores: Mutex::new(HashMap::new()),
@@ -315,6 +344,12 @@ async fn main() {
         .nest("/auth", auth::auth_routes(state.clone()))
         .nest("/api", api_routes)
         .merge(ws_routes)
+        // Security headers are belt-and-suspenders: Cloudflare adds
+        // these on the live deploy too, but local / Tailscale-direct
+        // access bypasses the edge. Order: trace_layer wraps response
+        // observation, security_headers writes headers on the way back
+        // out — applied last so it sees the final response.
+        .layer(axum::middleware::from_fn(security_headers::middleware))
         .layer(trace_layer);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
@@ -403,22 +438,30 @@ async fn ui_ws_handler(
         }
     }
 
-    // 2. Cookie auth.
-    let mut is_authenticated = false;
-    if dev_mode {
-        is_authenticated = true;
-    } else if let Some(cookie) = jar.get("auth_token") {
-        if auth::verify_token(cookie.value()) {
-            is_authenticated = true;
+    // 2. Cookie auth + role capture. We pin the user's role at connect
+    //    time *and* re-check it on each mutating message in
+    //    handle_ui_socket — neither alone is enough. Pinning catches the
+    //    "log in then upgrade WS while still admin" race; re-check
+    //    catches the "demoted while WS still open" case.
+    let (login, initial_role) = if dev_mode {
+        ("dev".to_string(), auth::Role::Admin)
+    } else {
+        let Some(cookie) = jar.get("auth_token") else {
+            tracing::warn!("ui ws: no auth cookie");
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        };
+        let Some(claims) = auth::claims_from_token(cookie.value()) else {
+            tracing::warn!("ui ws: invalid jwt");
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        };
+        if !claims.mfa {
+            tracing::warn!(login = %claims.sub, "ui ws: pending-mfa cookie rejected");
+            return (StatusCode::FORBIDDEN, "MFA required").into_response();
         }
-    }
+        (claims.sub.clone(), auth::Role::parse(&claims.role))
+    };
 
-    if !is_authenticated {
-        tracing::warn!("unauthorized ui connection attempt");
-        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-    }
-
-    ws.on_upgrade(|socket| handle_ui_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_ui_socket(socket, state, login, initial_role))
         .into_response()
 }
 
@@ -787,8 +830,55 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
     }
 }
 
-async fn handle_ui_socket(socket: WebSocket, state: Arc<AppState>) {
-    tracing::info!("new ui websocket connection");
+/// Returns true if a Message sent UI→agent should be considered a
+/// **mutating** action — that is, something that changes state on the
+/// host (start a service, write a config, run apt, send terminal
+/// keystrokes, exec into a container, etc.). Viewers are blocked from
+/// sending these over the UI WebSocket.
+///
+/// Read-only / informational variants (List*, Inspect*, Read*, Logs,
+/// Stats, Status, Refresh) return false. Default-deny: any new variant
+/// not explicitly listed here is treated as mutating, so a forgotten
+/// match arm fails closed.
+fn is_mutating_agent_message(msg: &Message) -> bool {
+    use Message::*;
+    match msg {
+        // Pure reads — viewer-OK.
+        ListServicesRequest
+        | ReadConfigRequest { .. }
+        | SystemStatsRequest
+        | DockerListRequest
+        | SwarmListRequest
+        | AptStatusRequest
+        | DockerLogsRequest { .. }
+        | DockerLogsStop { .. }
+        | JournalLogsRequest { .. }
+        | JournalLogsStop { .. }
+        | SwarmServiceInspectRequest { .. }
+        | BackupListArchivesRequest { .. }
+        | DockerImageListRequest
+        | DockerNetworkListRequest
+        | DockerNetworkInspectRequest { .. }
+        | DockerVolumeListRequest
+        | DockerVolumeInspectRequest { .. }
+        | SwarmStackListRequest
+        | SwarmStackInspectRequest { .. }
+        | DockerStatsRequest => false,
+        // Everything else is treated as mutating. AptRefreshRequest
+        // counts as mutating because it triggers `apt-get update`,
+        // which writes to /var/lib/apt/lists and can interact with
+        // package locks; a viewer shouldn't be able to nudge that.
+        _ => true,
+    }
+}
+
+async fn handle_ui_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    login: String,
+    _initial_role: auth::Role,
+) {
+    tracing::info!(%login, "new ui websocket connection");
     let (mut sender, mut receiver) = socket.split();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UiMessage>();
@@ -849,6 +939,44 @@ async fn handle_ui_socket(socket: WebSocket, state: Arc<AppState>) {
                     let _ = tx.send(UiMessage::ListAgentsResponse { agents });
                 }
                 UiMessage::SendToAgent { agent_id, message } => {
+                    // CE RBAC over the WebSocket plane. The HTTP rbac
+                    // middleware doesn't run here — without this gate
+                    // a viewer with a verified session could
+                    // ControlServiceRequest, AptUpgradeRequest,
+                    // DockerContainerActionRequest, send terminal
+                    // keystrokes, etc., bypassing the entire role
+                    // model. Re-resolve the role from the DB on every
+                    // mutating message so a freshly-demoted admin is
+                    // blocked immediately.
+                    if !auth::is_dev_mode() && is_mutating_agent_message(&message) {
+                        let role_str = match crate::db::get_user(&state.db, &login).await {
+                            Ok(Some(row)) => row.role,
+                            _ => "viewer".to_string(),
+                        };
+                        if auth::Role::parse(&role_str) != auth::Role::Admin {
+                            tracing::warn!(
+                                %login, %agent_id,
+                                "ui ws: rejected mutating message from non-admin"
+                            );
+                            crate::db::record_audit(
+                                &state.db,
+                                now_unix(),
+                                Some(&login),
+                                Some(&agent_id),
+                                "ws.send_to_agent.denied",
+                                false,
+                                Some(&format!(
+                                    "role={role_str} variant={}",
+                                    serde_json::to_value(&message)
+                                        .ok()
+                                        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
+                                        .unwrap_or_else(|| "unknown".into())
+                                )),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
                     if let Some(agent_tx) = state.agents.lock().await.get(&agent_id) {
                         let _ = agent_tx.send(message);
                     }

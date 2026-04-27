@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 use crate::{auth, AppState};
 
@@ -257,10 +258,15 @@ async fn confirm_handler(
     if body.recovery_codes.len() != RECOVERY_CODE_COUNT {
         return (StatusCode::BAD_REQUEST, "wrong recovery code count").into_response();
     }
+    // Encrypt sensitive columns at rest so a DB-only backup leak
+    // doesn't expose TOTP secrets or recovery-code hashes.
+    let encrypted_secret = crate::crypto::encrypt(&body.secret);
     let hashes = hashes_for_codes(&body.recovery_codes);
     let hashes_json = serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into());
-    if let Err(e) = crate::db::set_user_totp(&state.db, &claims.sub, &body.secret, &hashes_json)
-        .await
+    let encrypted_hashes = crate::crypto::encrypt(&hashes_json);
+    if let Err(e) =
+        crate::db::set_user_totp(&state.db, &claims.sub, &encrypted_secret, &encrypted_hashes)
+            .await
     {
         tracing::error!(error = %e, "failed to enable totp");
         return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
@@ -305,11 +311,49 @@ async fn verify_handler(
         Some(c) => c,
         None => return (StatusCode::UNAUTHORIZED, "no pending mfa").into_response(),
     };
+
+    // Brute-force defence: lock the per-login MFA throttle after
+    // MAX_FAILS bad codes. The pending-MFA cookie has a 10-minute TTL,
+    // so the only way to attempt this many guesses is sustained access
+    // to the victim's browser session — and we'd much rather force a
+    // re-login at that point.
+    let now = crate::now_unix();
+    if let crate::throttle::CheckResult::Locked { retry_after_secs } =
+        state.mfa_throttle.check(&pending.sub, now)
+    {
+        crate::db::record_audit(
+            &state.db,
+            now,
+            Some(&pending.sub),
+            None,
+            "auth.mfa.locked",
+            false,
+            Some(&format!("retry_after={retry_after_secs}s")),
+        )
+        .await;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )],
+            "too many failed attempts; try again later",
+        )
+            .into_response();
+    }
     let row = match crate::db::get_user(&state.db, &pending.sub).await {
         Ok(Some(r)) if r.totp_enabled != 0 => r,
         _ => return (StatusCode::BAD_REQUEST, "totp not enabled").into_response(),
     };
-    let secret = match row.totp_secret.as_deref() {
+    // Decrypt the AES-GCM-protected secret. None means the ciphertext
+    // is corrupt or was encrypted with a different key (e.g. JWT_SECRET
+    // rotated without a TOTP re-enroll). Treat that like a missing
+    // secret — the user has to re-enroll out-of-band.
+    let secret_plain = row
+        .totp_secret
+        .as_deref()
+        .and_then(crate::crypto::decrypt);
+    let secret = match secret_plain.as_deref() {
         Some(s) => s,
         None => return (StatusCode::BAD_REQUEST, "totp not enabled").into_response(),
     };
@@ -317,14 +361,31 @@ async fn verify_handler(
     let mut used_recovery = false;
     let totp_ok = verify_totp(secret, &body.code);
     let recovery_ok = if !totp_ok {
+        // Decrypt the recovery-codes ciphertext, then JSON-parse the
+        // inner array of hashes.
+        let hashes_plain = crate::crypto::decrypt(&row.totp_recovery_hashes).unwrap_or_default();
         let mut hashes: Vec<String> =
-            serde_json::from_str(&row.totp_recovery_hashes).unwrap_or_default();
+            serde_json::from_str(&hashes_plain).unwrap_or_default();
         let target = hash_recovery(&body.code);
-        if let Some(idx) = hashes.iter().position(|h| h == &target) {
+        // Constant-time compare against EVERY stored hash so the loop
+        // takes the same time regardless of which (if any) matches.
+        // String `==` would short-circuit and leak match position via
+        // timing.
+        let target_bytes = target.as_bytes();
+        let mut found_idx: Option<usize> = None;
+        for (i, h) in hashes.iter().enumerate() {
+            let eq: bool = h.as_bytes().ct_eq(target_bytes).into();
+            if eq && found_idx.is_none() {
+                found_idx = Some(i);
+            }
+        }
+        if let Some(idx) = found_idx {
             hashes.remove(idx);
             let new_json = serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into());
+            let new_encrypted = crate::crypto::encrypt(&new_json);
             if let Err(e) =
-                crate::db::update_user_recovery_hashes(&state.db, &pending.sub, &new_json).await
+                crate::db::update_user_recovery_hashes(&state.db, &pending.sub, &new_encrypted)
+                    .await
             {
                 tracing::warn!(error = %e, "failed to burn recovery code");
             }
@@ -338,9 +399,10 @@ async fn verify_handler(
     };
 
     if !totp_ok && !recovery_ok {
+        state.mfa_throttle.record_failure(&pending.sub, now);
         crate::db::record_audit(
             &state.db,
-            crate::now_unix(),
+            now,
             Some(&pending.sub),
             None,
             "auth.mfa.fail",
@@ -351,6 +413,7 @@ async fn verify_handler(
         return (StatusCode::UNAUTHORIZED, "invalid code").into_response();
     }
 
+    state.mfa_throttle.record_success(&pending.sub);
     let role = auth::Role::parse(&row.role);
     let token = match auth::issue_jwt(&pending.sub, role, true, 24 * 3600) {
         Ok(t) => t,
