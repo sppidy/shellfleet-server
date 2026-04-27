@@ -25,6 +25,12 @@ cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 url = "2.5"
 
+# TOTP (RFC 6238) + recovery-code hashing for the 2FA flow.
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+data-encoding = "2.11"
+
 # sqlx for the persistent token / pending-device / audit store. The
 # `bundled` libsqlite3-sys feature compiles sqlite into the binary so
 # we don't need a runtime apt dependency.

@@ -6,8 +6,10 @@ mod device_auth;
 mod fan_out;
 mod health;
 mod labels;
+mod mfa;
 mod notifications;
 mod probe_library;
+mod rbac;
 mod tokens;
 mod update_windows;
 mod webhook;
@@ -114,6 +116,11 @@ async fn features_handler() -> impl IntoResponse {
 #[derive(Serialize)]
 struct MeResponse {
     user: String,
+    role: String,
+    mfa_enabled: bool,
+    /// True when the active session is fully verified. False during the
+    /// pending-MFA window between OAuth and successful TOTP entry.
+    mfa_verified: bool,
 }
 
 #[derive(Deserialize)]
@@ -123,19 +130,11 @@ struct AuditQuery {
 }
 
 async fn audit_handler(
-    jar: CookieJar,
     State(state): State<Arc<AppState>>,
     Query(q): Query<AuditQuery>,
 ) -> impl IntoResponse {
-    if std::env::var("JWT_SECRET").unwrap_or_default() != "dev" {
-        let cookie = match jar.get("auth_token") {
-            Some(c) => c,
-            None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-        };
-        if !auth::verify_token(cookie.value()) {
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        }
-    }
+    // Auth + RBAC are enforced by the rbac middleware layered on
+    // api_routes; by the time we get here the request is authed.
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     match db::recent_audit(&state.db, limit).await {
         Ok(rows) => axum::Json(rows).into_response(),
@@ -146,16 +145,42 @@ async fn audit_handler(
     }
 }
 
-async fn me_handler(jar: CookieJar) -> impl IntoResponse {
-    if std::env::var("JWT_SECRET").unwrap_or_default() == "dev" {
-        return (StatusCode::OK, axum::Json(MeResponse { user: "dev".into() })).into_response();
+async fn me_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if auth::is_dev_mode() {
+        return (
+            StatusCode::OK,
+            axum::Json(MeResponse {
+                user: "dev".into(),
+                role: "admin".into(),
+                mfa_enabled: false,
+                mfa_verified: true,
+            }),
+        )
+            .into_response();
     }
-    if let Some(cookie) = jar.get("auth_token") {
-        if let Some(user) = auth::user_from_token(cookie.value()) {
-            return (StatusCode::OK, axum::Json(MeResponse { user })).into_response();
-        }
-    }
-    (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+    let Some(cookie) = jar.get("auth_token") else {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    };
+    let Some(claims) = auth::claims_from_token(cookie.value()) else {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    };
+    let (role, mfa_enabled) = match db::get_user(&state.db, &claims.sub).await {
+        Ok(Some(row)) => (row.role, row.totp_enabled != 0),
+        _ => (claims.role.clone(), false),
+    };
+    (
+        StatusCode::OK,
+        axum::Json(MeResponse {
+            user: claims.sub,
+            role,
+            mfa_enabled,
+            mfa_verified: claims.mfa,
+        }),
+    )
+        .into_response()
 }
 
 fn init_tracing() {
@@ -197,6 +222,31 @@ async fn main() {
         });
     }
 
+    // CE: 7-day local audit retention. Runs hourly so a long-running
+    // server eventually drops old rows even without a restart. The
+    // retention window is intentionally fixed in CE — EE will expose
+    // it as a knob alongside the long-retention / SIEM-export sink.
+    {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            const RETENTION_SECS: i64 = 7 * 24 * 3600;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let cutoff = now_unix() - RETENTION_SECS;
+                match db::purge_audit_before(&pool, cutoff).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(%removed, %cutoff, "purged audit rows older than retention window");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "audit retention sweep failed");
+                    }
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         agents: Mutex::new(HashMap::new()),
         ui_clients: Mutex::new(HashMap::new()),
@@ -228,17 +278,25 @@ async fn main() {
     }
     let api_routes = api_routes
         .nest("/probe-library", probe_library::routes())
+        .nest("/auth/mfa", mfa::routes())
         .route("/me", get(me_handler))
         .route("/healthz", get(healthz))
         .route("/audit", get(audit_handler))
         .route("/features", get(features_handler))
+        // RBAC runs after CSRF: CSRF rejects forged cross-site writes,
+        // RBAC rejects insufficiently-privileged callers (viewer-on-
+        // mutating, pending-MFA-on-anything-but-/verify, etc.).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rbac::middleware,
+        ))
         .layer(axum::middleware::from_fn(csrf::middleware))
         .with_state(state.clone());
 
     let ws_routes = Router::new()
         .route("/agent/ws", get(agent_ws_handler))
         .route("/ui/ws", get(ui_ws_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
     let trace_layer = TraceLayer::new_for_http()
         .on_response(DefaultOnResponse::new().level(Level::INFO))
@@ -246,7 +304,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .nest("/auth", auth::auth_routes())
+        .nest("/auth", auth::auth_routes(state.clone()))
         .nest("/api", api_routes)
         .merge(ws_routes)
         .layer(trace_layer);

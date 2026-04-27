@@ -96,6 +96,27 @@ pub async fn init() -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
+    // CE: per-user state for RBAC + 2FA. Created lazily on first OAuth
+    // sign-in (see auth::callback_handler). Roles are restricted to the
+    // CE-supported pair (admin / viewer); EE will introduce richer roles
+    // through the extension API rather than by widening this column.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            login TEXT PRIMARY KEY,
+            role TEXT NOT NULL DEFAULT 'viewer'
+                CHECK (role IN ('admin', 'viewer')),
+            totp_enabled INTEGER NOT NULL DEFAULT 0,
+            totp_secret TEXT,
+            totp_recovery_hashes TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_login_at INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS update_windows (
@@ -1145,6 +1166,145 @@ pub async fn recent_audit(pool: &SqlitePool, limit: i64) -> Result<Vec<AuditRow>
         "SELECT id, ts, actor, agent_id, kind, ok, detail FROM audit ORDER BY ts DESC, id DESC LIMIT ?",
     )
     .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// CE: drop audit rows older than `cutoff_ts`. Called from a daily
+/// task in `main` to honor the 7-day local retention promise.
+pub async fn purge_audit_before(pool: &SqlitePool, cutoff_ts: i64) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM audit WHERE ts < ?")
+        .bind(cutoff_ts)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+// ---------- users ----------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserRow {
+    pub login: String,
+    pub role: String,
+    pub totp_enabled: i64,
+    pub totp_secret: Option<String>,
+    pub totp_recovery_hashes: String,
+    #[allow(dead_code)]
+    pub created_at: i64,
+    #[allow(dead_code)]
+    pub last_login_at: i64,
+}
+
+pub async fn get_user(pool: &SqlitePool, login: &str) -> Result<Option<UserRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserRow>(
+        "SELECT login, role, totp_enabled, totp_secret, totp_recovery_hashes, \
+         created_at, last_login_at FROM users WHERE login = ?",
+    )
+    .bind(login)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn count_users(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+        .fetch_one(pool)
+        .await
+}
+
+/// Insert the user if they don't exist (role defaulted by caller — admin
+/// for the very first user, viewer otherwise) and bump `last_login_at`.
+/// Returns the row as it stands after the upsert.
+pub async fn upsert_login(
+    pool: &SqlitePool,
+    login: &str,
+    default_role_if_new: &str,
+    now: i64,
+) -> Result<UserRow, sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO users (login, role, created_at, last_login_at)
+        VALUES (?1, ?2, ?3, ?3)
+        ON CONFLICT(login) DO UPDATE SET last_login_at = excluded.last_login_at
+        "#,
+    )
+    .bind(login)
+    .bind(default_role_if_new)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let row = get_user(pool, login).await?.expect("just upserted");
+    Ok(row)
+}
+
+pub async fn set_user_role(
+    pool: &SqlitePool,
+    login: &str,
+    role: &str,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("UPDATE users SET role = ? WHERE login = ?")
+        .bind(role)
+        .bind(login)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn set_user_totp(
+    pool: &SqlitePool,
+    login: &str,
+    secret: &str,
+    recovery_hashes_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET totp_enabled = 1, totp_secret = ?, totp_recovery_hashes = ? \
+         WHERE login = ?",
+    )
+    .bind(secret)
+    .bind(recovery_hashes_json)
+    .bind(login)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_user_totp(pool: &SqlitePool, login: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_recovery_hashes = '[]' \
+         WHERE login = ?",
+    )
+    .bind(login)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_user_recovery_hashes(
+    pool: &SqlitePool,
+    login: &str,
+    recovery_hashes_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET totp_recovery_hashes = ? WHERE login = ?")
+        .bind(recovery_hashes_json)
+        .bind(login)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct UserListRow {
+    pub login: String,
+    pub role: String,
+    pub totp_enabled: i64,
+    pub created_at: i64,
+    pub last_login_at: i64,
+}
+
+pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserListRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserListRow>(
+        "SELECT login, role, totp_enabled, created_at, last_login_at \
+         FROM users ORDER BY login",
+    )
     .fetch_all(pool)
     .await
 }

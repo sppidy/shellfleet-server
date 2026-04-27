@@ -1,0 +1,420 @@
+//! CE 2FA: TOTP (RFC 6238) enrollment + verification.
+//!
+//! Endpoints (all mounted under `/api/auth/mfa` so the existing CSRF
+//! middleware applies):
+//!
+//! - `GET    /status`   — `{ enabled }` for the current user.
+//! - `POST   /start`    — generate a fresh secret + recovery codes;
+//!                        return them along with the `otpauth://` URI
+//!                        for the dashboard to render as a QR. Nothing
+//!                        is persisted yet — this lets the user back
+//!                        out without leaving the account in a half-
+//!                        enrolled state.
+//! - `POST   /confirm`  — body `{ secret, code, recovery_codes }`.
+//!                        Verifies the code against the candidate
+//!                        secret, then persists the secret + the
+//!                        SHA-256 hashes of the recovery codes.
+//! - `POST   /verify`   — body `{ code }`. Used by the post-OAuth
+//!                        challenge page: takes a pending-MFA cookie,
+//!                        verifies the TOTP code (or burns a recovery
+//!                        code), and re-issues a full-session JWT.
+//! - `POST   /disable`  — body `{ code }`. Self-service disable —
+//!                        requires a fresh TOTP code so a stolen
+//!                        session cookie can't drop the second factor.
+//!
+//! Storage:
+//!
+//! - `users.totp_secret`            base32 string (no padding).
+//! - `users.totp_recovery_hashes`   JSON array of hex-encoded SHA-256
+//!                                  hashes of the *upper-cased*
+//!                                  recovery code with dashes
+//!                                  stripped.
+//! - `users.totp_enabled`           1 once `confirm` succeeds.
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use axum_extra::extract::cookie::CookieJar;
+use data_encoding::BASE32_NOPAD;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+
+use crate::{auth, AppState};
+
+const TOTP_PERIOD: u64 = 30;
+const TOTP_DIGITS: u32 = 6;
+const TOTP_ISSUER: &str = "sys-manager";
+/// ±1 30s window — total acceptance window 90s, the standard skew
+/// budget per RFC 6238 §6 advice.
+const TOTP_SKEW_STEPS: i64 = 1;
+const RECOVERY_CODE_COUNT: usize = 10;
+const SECRET_BYTES: usize = 20; // 160-bit, the RFC-recommended minimum
+
+type HmacSha1 = Hmac<Sha1>;
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/status", get(status_handler))
+        .route("/start", post(start_handler))
+        .route("/confirm", post(confirm_handler))
+        .route("/verify", post(verify_handler))
+        .route("/disable", post(disable_handler))
+}
+
+// ---------------------------------------------------------------------
+// TOTP primitives
+// ---------------------------------------------------------------------
+
+/// Generate a new 160-bit secret encoded as base32 (no padding) — the
+/// form accepted by every authenticator app and the `otpauth://` URI.
+fn generate_secret_b32() -> String {
+    let mut buf = [0u8; SECRET_BYTES];
+    rand::thread_rng().fill_bytes(&mut buf);
+    BASE32_NOPAD.encode(&buf)
+}
+
+/// HOTP per RFC 4226. `counter` is the moving factor; for TOTP the
+/// caller divides Unix time by the period.
+fn hotp(secret_bytes: &[u8], counter: u64) -> u32 {
+    let mut mac = HmacSha1::new_from_slice(secret_bytes).expect("hmac key");
+    mac.update(&counter.to_be_bytes());
+    let hash = mac.finalize().into_bytes();
+    let offset = (hash[hash.len() - 1] & 0x0f) as usize;
+    let code = ((u32::from(hash[offset]) & 0x7f) << 24)
+        | ((u32::from(hash[offset + 1]) & 0xff) << 16)
+        | ((u32::from(hash[offset + 2]) & 0xff) << 8)
+        | (u32::from(hash[offset + 3]) & 0xff);
+    code % 10u32.pow(TOTP_DIGITS)
+}
+
+fn current_step(now: u64) -> u64 {
+    now / TOTP_PERIOD
+}
+
+/// Returns true if `code` matches the TOTP for `secret_b32` at the
+/// current step or within ±TOTP_SKEW_STEPS of it.
+fn verify_totp(secret_b32: &str, code: &str) -> bool {
+    let Ok(secret_bytes) = BASE32_NOPAD.decode(secret_b32.to_ascii_uppercase().as_bytes()) else {
+        return false;
+    };
+    let Ok(code_num) = code.trim().parse::<u32>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let step = current_step(now) as i64;
+    for delta in -TOTP_SKEW_STEPS..=TOTP_SKEW_STEPS {
+        let candidate_step = step.saturating_add(delta).max(0) as u64;
+        if hotp(&secret_bytes, candidate_step) == code_num {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build an `otpauth://totp/...` URI for the authenticator app.
+fn otpauth_uri(login: &str, secret_b32: &str) -> String {
+    let label = format!("{TOTP_ISSUER}:{login}");
+    format!(
+        "otpauth://totp/{label}?secret={secret_b32}&issuer={TOTP_ISSUER}&algorithm=SHA1&digits={TOTP_DIGITS}&period={TOTP_PERIOD}",
+        label = urlencoding::encode(&label),
+        secret_b32 = secret_b32,
+        TOTP_ISSUER = TOTP_ISSUER,
+        TOTP_DIGITS = TOTP_DIGITS,
+        TOTP_PERIOD = TOTP_PERIOD,
+    )
+}
+
+// ---------------------------------------------------------------------
+// Recovery codes
+// ---------------------------------------------------------------------
+
+fn generate_recovery_codes() -> Vec<String> {
+    // 10 codes of the form XXXX-XXXX (8 base32 chars, dash for
+    // readability). We keep the alphabet to base32 so the codes are
+    // unambiguous on paper / in a screenshot.
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut rng = rand::thread_rng();
+    (0..RECOVERY_CODE_COUNT)
+        .map(|_| {
+            let mut buf = [0u8; 8];
+            rng.fill_bytes(&mut buf);
+            let chars: String = buf
+                .iter()
+                .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+                .collect();
+            format!("{}-{}", &chars[0..4], &chars[4..8])
+        })
+        .collect()
+}
+
+fn normalize_recovery(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+fn hash_recovery(code: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(normalize_recovery(code).as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hashes_for_codes(codes: &[String]) -> Vec<String> {
+    codes.iter().map(|c| hash_recovery(c)).collect()
+}
+
+// ---------------------------------------------------------------------
+// Endpoint handlers
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct StatusResponse {
+    enabled: bool,
+}
+
+async fn status_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if auth::is_dev_mode() {
+        return Json(StatusResponse { enabled: false }).into_response();
+    }
+    // Allow status checks even from a pending-MFA session — the UI
+    // needs to know whether the user is mid-enrollment.
+    let cookie = match jar.get("auth_token") {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+    let claims = match auth::claims_from_token(cookie.value()) {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+    let enabled = match crate::db::get_user(&state.db, &claims.sub).await {
+        Ok(Some(row)) => row.totp_enabled != 0,
+        _ => false,
+    };
+    Json(StatusResponse { enabled }).into_response()
+}
+
+#[derive(Serialize)]
+struct StartResponse {
+    secret: String,
+    otpauth_uri: String,
+    recovery_codes: Vec<String>,
+}
+
+async fn start_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let claims = match auth::current_user(&jar, &state.db).await {
+        Ok(c) => c,
+        Err(err) => return err.into_response(),
+    };
+    let secret = generate_secret_b32();
+    let codes = generate_recovery_codes();
+    let uri = otpauth_uri(&claims.sub, &secret);
+    Json(StartResponse {
+        secret,
+        otpauth_uri: uri,
+        recovery_codes: codes,
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ConfirmRequest {
+    secret: String,
+    code: String,
+    recovery_codes: Vec<String>,
+}
+
+async fn confirm_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ConfirmRequest>,
+) -> impl IntoResponse {
+    let claims = match auth::current_user(&jar, &state.db).await {
+        Ok(c) => c,
+        Err(err) => return err.into_response(),
+    };
+    if !verify_totp(&body.secret, &body.code) {
+        return (StatusCode::BAD_REQUEST, "invalid code").into_response();
+    }
+    if body.recovery_codes.len() != RECOVERY_CODE_COUNT {
+        return (StatusCode::BAD_REQUEST, "wrong recovery code count").into_response();
+    }
+    let hashes = hashes_for_codes(&body.recovery_codes);
+    let hashes_json = serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into());
+    if let Err(e) = crate::db::set_user_totp(&state.db, &claims.sub, &body.secret, &hashes_json)
+        .await
+    {
+        tracing::error!(error = %e, "failed to enable totp");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+    }
+    crate::db::record_audit(
+        &state.db,
+        crate::now_unix(),
+        Some(&claims.sub),
+        None,
+        "auth.mfa.enabled",
+        true,
+        None,
+    )
+    .await;
+    (StatusCode::OK, "ok").into_response()
+}
+
+#[derive(Deserialize)]
+struct VerifyRequest {
+    code: String,
+}
+
+#[derive(Serialize)]
+struct VerifyResponse {
+    ok: bool,
+    used_recovery: bool,
+}
+
+async fn verify_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<VerifyRequest>,
+) -> impl IntoResponse {
+    if auth::is_dev_mode() {
+        return Json(VerifyResponse {
+            ok: true,
+            used_recovery: false,
+        })
+        .into_response();
+    }
+    let pending = match auth::pending_mfa_claims(&jar) {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "no pending mfa").into_response(),
+    };
+    let row = match crate::db::get_user(&state.db, &pending.sub).await {
+        Ok(Some(r)) if r.totp_enabled != 0 => r,
+        _ => return (StatusCode::BAD_REQUEST, "totp not enabled").into_response(),
+    };
+    let secret = match row.totp_secret.as_deref() {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, "totp not enabled").into_response(),
+    };
+
+    let mut used_recovery = false;
+    let totp_ok = verify_totp(secret, &body.code);
+    let recovery_ok = if !totp_ok {
+        let mut hashes: Vec<String> =
+            serde_json::from_str(&row.totp_recovery_hashes).unwrap_or_default();
+        let target = hash_recovery(&body.code);
+        if let Some(idx) = hashes.iter().position(|h| h == &target) {
+            hashes.remove(idx);
+            let new_json = serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into());
+            if let Err(e) =
+                crate::db::update_user_recovery_hashes(&state.db, &pending.sub, &new_json).await
+            {
+                tracing::warn!(error = %e, "failed to burn recovery code");
+            }
+            used_recovery = true;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !totp_ok && !recovery_ok {
+        crate::db::record_audit(
+            &state.db,
+            crate::now_unix(),
+            Some(&pending.sub),
+            None,
+            "auth.mfa.fail",
+            false,
+            None,
+        )
+        .await;
+        return (StatusCode::UNAUTHORIZED, "invalid code").into_response();
+    }
+
+    let role = auth::Role::parse(&row.role);
+    let token = match auth::issue_jwt(&pending.sub, role, true, 24 * 3600) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to issue post-mfa jwt");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "jwt error").into_response();
+        }
+    };
+    crate::db::record_audit(
+        &state.db,
+        crate::now_unix(),
+        Some(&pending.sub),
+        None,
+        if used_recovery { "auth.mfa.recovery" } else { "auth.mfa.ok" },
+        true,
+        None,
+    )
+    .await;
+
+    let cookie = auth::build_session_cookie(token);
+    (jar.add(cookie), Json(VerifyResponse { ok: true, used_recovery })).into_response()
+}
+
+#[derive(Deserialize)]
+struct DisableRequest {
+    code: String,
+}
+
+async fn disable_handler(
+    jar: CookieJar,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DisableRequest>,
+) -> impl IntoResponse {
+    let claims = match auth::current_user(&jar, &state.db).await {
+        Ok(c) => c,
+        Err(err) => return err.into_response(),
+    };
+    let row = match crate::db::get_user(&state.db, &claims.sub).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "no such user").into_response(),
+    };
+    if row.totp_enabled == 0 {
+        return (StatusCode::OK, "already disabled").into_response();
+    }
+    let secret = match row.totp_secret.as_deref() {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, "totp not enabled").into_response(),
+    };
+    if !verify_totp(secret, &body.code) {
+        return (StatusCode::UNAUTHORIZED, "invalid code").into_response();
+    }
+    if let Err(e) = crate::db::clear_user_totp(&state.db, &claims.sub).await {
+        tracing::error!(error = %e, "failed to disable totp");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+    }
+    crate::db::record_audit(
+        &state.db,
+        crate::now_unix(),
+        Some(&claims.sub),
+        None,
+        "auth.mfa.disabled",
+        true,
+        None,
+    )
+    .await;
+    (StatusCode::OK, "ok").into_response()
+}
