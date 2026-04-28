@@ -40,8 +40,11 @@
 //! | `TELEGRAM_BOT_TOKEN` +      | Bot API `sendMessage` with HTML        |
 //! | `TELEGRAM_CHAT_ID`          | parse_mode and `<pre>` log tail.       |
 
+use std::sync::{Arc, OnceLock};
+
 use serde::Serialize;
 use sqlx::SqlitePool;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::db;
 
@@ -150,11 +153,80 @@ fn discord_text(headline: &str, agent_id: &str, status: &str, error: Option<&str
     text
 }
 
-/// Minimal HTML escape for the small fields we drop into Telegram.
-/// Telegram's HTML parser only treats `<`, `>`, `&` as special; we
-/// don't emit `"` inside attributes so leave that alone.
+/// HTML escape for fields we drop into Telegram message bodies AND
+/// for any upstream-sourced text we persist in audit rows. Telegram's
+/// HTML parser only treats `<`, `>`, `&` as special, but we cover
+/// `'` and `"` too so the same helper is safe for any HTML-rendered
+/// audit-log viewer that might escape attributes differently.
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&#39;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Strip ANSI CSI escape sequences, BiDi overrides, and other C0/C1
+/// control characters (keeping `\t`, `\n`, `\r`) from `s`. Used on
+/// upstream-sourced text before it lands in audit rows or logs:
+/// without this, a malicious sink response could embed cursor
+/// movements, color codes, or right-to-left overrides that confuse
+/// an operator reading `/activity`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: ESC `[` … <final byte in 0x40..=0x7E>. Drop the
+            // entire sequence. A bare ESC (no `[`) is also dropped.
+            if matches!(chars.peek(), Some(&'[')) {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if matches!(n, '\u{40}'..='\u{7e}') {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        // BiDi overrides — Trojan-Source-style attacks.
+        if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+            continue;
+        }
+        if c.is_control() && c != '\t' && c != '\n' && c != '\r' {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A bot token that intentionally redacts itself in `Debug` output
+/// so an accidental `tracing::debug!(?sink)` somewhere in the
+/// dispatcher can't leak it into structured logs. The reqwest
+/// trace target (`RUST_LOG=reqwest=trace`) still sees the URL we
+/// build — operators must filter that target out in production.
+#[derive(Clone)]
+struct RedactedToken(String);
+
+impl std::fmt::Debug for RedactedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedToken(<redacted>)")
+    }
+}
+
+impl RedactedToken {
+    fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 fn telegram_text(headline: &str, agent_id: &str, status: &str, error: Option<&str>, log: &str) -> String {
@@ -192,9 +264,10 @@ enum Sink {
     Slack { url: String },
     /// Discord webhook with native `content` field.
     Discord { url: String },
-    /// Telegram Bot API. URL is derived from the token at fire time
-    /// so the secret never lives in the struct.
-    Telegram { bot_token: String, chat_id: String },
+    /// Telegram Bot API. The token is wrapped in `RedactedToken` so
+    /// it never lands in `?sink`-style debug prints; only `expose()`
+    /// hands it back as a `&str` for URL construction.
+    Telegram { bot_token: RedactedToken, chat_id: String },
 }
 
 impl Sink {
@@ -253,7 +326,10 @@ fn configured_sinks(prefix: &str) -> Vec<Sink> {
     let token = env_with_fallback(prefix, "TELEGRAM_BOT_TOKEN");
     let chat_id = env_with_fallback(prefix, "TELEGRAM_CHAT_ID");
     if !token.is_empty() && !chat_id.is_empty() {
-        sinks.push(Sink::Telegram { bot_token: token, chat_id });
+        sinks.push(Sink::Telegram {
+            bot_token: RedactedToken(token),
+            chat_id,
+        });
     }
 
     sinks
@@ -277,51 +353,129 @@ struct Event {
     at: i64,
 }
 
+/// One job pushed onto the dispatch queue. Held briefly while the
+/// worker acquires a concurrency permit; cheap to enqueue.
+struct DispatchJob {
+    db: SqlitePool,
+    prefix: &'static str,
+    event: Event,
+}
+
+/// Bounded queue and concurrency cap for outbound HTTP. The previous
+/// implementation `tokio::spawn`d unboundedly per-event, which let a
+/// burst of probe transitions or a slow upstream (Telegram timeout
+/// queueing behind reqwest's connection pool) accumulate tasks
+/// without limit. With a bounded mpsc + a permit-gated worker,
+/// backpressure is visible: try_send returns Err on full and we
+/// drop-with-audit instead of growing memory.
+const QUEUE_CAP: usize = 1_000;
+const MAX_CONCURRENT_DELIVERIES: usize = 20;
+
+static DISPATCH_TX: OnceLock<mpsc::Sender<DispatchJob>> = OnceLock::new();
+
+fn dispatcher() -> &'static mpsc::Sender<DispatchJob> {
+    DISPATCH_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<DispatchJob>(QUEUE_CAP);
+        tokio::spawn(dispatcher_loop(rx));
+        tx
+    })
+}
+
+async fn dispatcher_loop(mut rx: mpsc::Receiver<DispatchJob>) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
+    while let Some(job) = rx.recv().await {
+        // Wait for a permit. If acquire_owned fails, the semaphore
+        // was closed which means we're shutting down — bail.
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            fire_inner(job.db, job.prefix, job.event).await;
+        });
+    }
+}
+
 /// Fire all sinks configured under `prefix` for `event`. No-op when
-/// no sinks are configured. Spawns ONE task that dispatches to every
-/// sink in parallel and audits each result independently.
+/// no sinks are configured. Enqueues a single dispatch job onto the
+/// global bounded queue; on full queue, records a `webhook.<kind>`
+/// failure audit row and drops the event rather than blocking the
+/// caller (the WS receive path) or spawning unboundedly.
 fn fire(db: SqlitePool, prefix: &'static str, event: Event) {
+    if configured_sinks(prefix).is_empty() {
+        return;
+    }
+    let tx = dispatcher();
+    let job = DispatchJob {
+        db: db.clone(),
+        prefix,
+        event: event.clone(),
+    };
+    if let Err(e) = tx.try_send(job) {
+        let kind = event.kind;
+        tracing::warn!(
+            error = %e,
+            kind = %kind,
+            agent_id = %event.agent_id,
+            "webhook: dispatch queue full, dropping event"
+        );
+        let agent_id = event.agent_id;
+        tokio::spawn(async move {
+            let _ = db::record_audit(
+                &db,
+                crate::now_unix(),
+                Some("webhook"),
+                Some(&agent_id),
+                &format!("webhook.{kind}"),
+                false,
+                Some("dispatch queue full, event dropped"),
+            )
+            .await;
+        });
+    }
+}
+
+async fn fire_inner(db: SqlitePool, prefix: &'static str, event: Event) {
     let sinks = configured_sinks(prefix);
     if sinks.is_empty() {
         return;
     }
-    tokio::spawn(async move {
-        let truncated = truncate(&event.log, LOG_CAP);
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, kind = %event.kind, "webhook: client build failed");
-                let _ = db::record_audit(
-                    &db,
-                    crate::now_unix(),
-                    Some("webhook"),
-                    Some(&event.agent_id),
-                    &format!("webhook.{}", event.kind),
-                    false,
-                    Some(&format!("client: {e}")),
-                )
-                .await;
-                return;
-            }
-        };
+    let truncated = truncate(&event.log, LOG_CAP);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, kind = %event.kind, "webhook: client build failed");
+            let _ = db::record_audit(
+                &db,
+                crate::now_unix(),
+                Some("webhook"),
+                Some(&event.agent_id),
+                &format!("webhook.{}", event.kind),
+                false,
+                Some(&format!("client: {e}")),
+            )
+            .await;
+            return;
+        }
+    };
 
-        let mut handles = Vec::with_capacity(sinks.len());
-        for sink in sinks {
-            let client = client.clone();
-            let db = db.clone();
-            let mut event = event.clone();
-            event.log = truncated.clone();
-            handles.push(tokio::spawn(async move {
-                deliver(&client, db, sink, event).await
-            }));
-        }
-        for h in handles {
-            let _ = h.await;
-        }
-    });
+    let mut handles = Vec::with_capacity(sinks.len());
+    for sink in sinks {
+        let client = client.clone();
+        let db = db.clone();
+        let mut event = event.clone();
+        event.log = truncated.clone();
+        handles.push(tokio::spawn(async move {
+            deliver(&client, db, sink, event).await
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
 }
 
 async fn deliver(client: &reqwest::Client, db: SqlitePool, sink: Sink, event: Event) {
@@ -364,7 +518,10 @@ async fn deliver(client: &reqwest::Client, db: SqlitePool, sink: Sink, event: Ev
             client.post(url).json(&body)
         }
         Sink::Telegram { bot_token, chat_id } => {
-            let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+            let url = format!(
+                "https://api.telegram.org/bot{}/sendMessage",
+                bot_token.expose(),
+            );
             let body = TelegramPayload {
                 chat_id,
                 text: telegram_text(
@@ -405,7 +562,14 @@ async fn deliver(client: &reqwest::Client, db: SqlitePool, sink: Sink, event: Ev
         Ok(resp) => {
             let code = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            let snippet = body.chars().take(200).collect::<String>();
+            // Sanitize before logging or auditing: an upstream sink
+            // could return ANSI control sequences, BiDi overrides,
+            // or HTML-special chars that confuse a `/activity`
+            // viewer. Strip controls first, then HTML-escape what's
+            // left. Cap length AFTER sanitize so escapes don't blow
+            // the budget by 6× (`&#39;` per quote).
+            let snippet: String = strip_ansi(&body).chars().take(200).collect();
+            let snippet = html_escape(&snippet);
             tracing::warn!(
                 agent_id = %event.agent_id,
                 kind = %event.kind,
