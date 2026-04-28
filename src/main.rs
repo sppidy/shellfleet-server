@@ -54,6 +54,17 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 type AgentTx = mpsc::UnboundedSender<Message>;
 type UiTx = mpsc::UnboundedSender<UiMessage>;
 
+/// One row in the live-agents map. Combining the WS sender with the
+/// reported capabilities under a single Mutex closes the race that
+/// existed when these were two parallel maps: a UI client could
+/// observe an agent in `agents` without yet appearing in
+/// `agent_capabilities` (or vice versa, on disconnect).
+#[derive(Clone)]
+pub struct AgentEntry {
+    pub tx: AgentTx,
+    pub capabilities: Vec<String>,
+}
+
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -67,11 +78,10 @@ pub type PendingBackupRestoreTx =
     tokio::sync::oneshot::Sender<shared::Message>;
 
 pub struct AppState {
-    pub agents: Mutex<HashMap<String, AgentTx>>,
-    /// agent_id → capability list reported on `Register`. Parallel
-    /// to `agents` so the existing send paths keep their tight type
-    /// (HashMap<String, AgentTx>). Cleared on disconnect.
-    pub agent_capabilities: Mutex<HashMap<String, Vec<String>>>,
+    /// Live-agent registry: agent_id → (tx, capabilities). Single
+    /// map (not two parallel ones) so a UI snapshot built under the
+    /// lock is internally consistent. Cleared on disconnect.
+    pub agents: Mutex<HashMap<String, AgentEntry>>,
     pub ui_clients: Mutex<HashMap<u64, UiTx>>,
     pub ui_id_counter: AtomicU64,
     pub db: SqlitePool,
@@ -107,8 +117,15 @@ pub struct AgentAuth {
 }
 
 async fn broadcast_agent_list(state: &AppState) {
-    let agents: Vec<String> = state.agents.lock().await.keys().cloned().collect();
-    let capabilities = state.agent_capabilities.lock().await.clone();
+    let (agents, capabilities) = {
+        let map = state.agents.lock().await;
+        let agents: Vec<String> = map.keys().cloned().collect();
+        let capabilities: HashMap<String, Vec<String>> = map
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.capabilities.clone()))
+            .collect();
+        (agents, capabilities)
+    };
     let msg = UiMessage::ListAgentsResponse { agents, capabilities };
     let mut clients = state.ui_clients.lock().await;
     clients.retain(|_id, tx| tx.send(msg.clone()).is_ok());
@@ -296,7 +313,6 @@ async fn main() {
 
     let state = Arc::new(AppState {
         agents: Mutex::new(HashMap::new()),
-        agent_capabilities: Mutex::new(HashMap::new()),
         ui_clients: Mutex::new(HashMap::new()),
         ui_id_counter: AtomicU64::new(0),
         db: pool,
@@ -570,12 +586,13 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                     let id = format!("{}-id", hostname);
                     agent_id_opt = Some(id.clone());
 
-                    state.agents.lock().await.insert(id.clone(), tx.clone());
-                    state
-                        .agent_capabilities
-                        .lock()
-                        .await
-                        .insert(id.clone(), capabilities.clone());
+                    state.agents.lock().await.insert(
+                        id.clone(),
+                        AgentEntry {
+                            tx: tx.clone(),
+                            capabilities: capabilities.clone(),
+                        },
+                    );
                     tracing::info!(
                         agent_id = %id,
                         %protocol_version,
@@ -901,7 +918,6 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
 
     if let Some(id) = agent_id_opt {
         state.agents.lock().await.remove(&id);
-        state.agent_capabilities.lock().await.remove(&id);
         tracing::info!(agent_id = %id, "agent disconnected");
         broadcast_agent_list(&state).await;
         // Outbound webhook fan-out (DISCONNECT_* env). Useful for
@@ -994,8 +1010,12 @@ async fn handle_ui_socket(
     state.ui_clients.lock().await.insert(client_id, tx.clone());
 
     {
-        let agents: Vec<String> = state.agents.lock().await.keys().cloned().collect();
-        let capabilities = state.agent_capabilities.lock().await.clone();
+        let map = state.agents.lock().await;
+        let agents: Vec<String> = map.keys().cloned().collect();
+        let capabilities: HashMap<String, Vec<String>> = map
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.capabilities.clone()))
+            .collect();
         let _ = tx.send(UiMessage::ListAgentsResponse { agents, capabilities });
     }
 
@@ -1043,9 +1063,12 @@ async fn handle_ui_socket(
         if let Ok(parsed_msg) = serde_json::from_str::<UiMessage>(&text) {
             match parsed_msg {
                 UiMessage::ListAgentsRequest => {
-                    let agents: Vec<String> =
-                        state.agents.lock().await.keys().cloned().collect();
-                    let capabilities = state.agent_capabilities.lock().await.clone();
+                    let map = state.agents.lock().await;
+                    let agents: Vec<String> = map.keys().cloned().collect();
+                    let capabilities: HashMap<String, Vec<String>> = map
+                        .iter()
+                        .map(|(id, entry)| (id.clone(), entry.capabilities.clone()))
+                        .collect();
                     let _ = tx.send(UiMessage::ListAgentsResponse { agents, capabilities });
                 }
                 UiMessage::SendToAgent { agent_id, message } => {
@@ -1087,8 +1110,8 @@ async fn handle_ui_socket(
                             continue;
                         }
                     }
-                    if let Some(agent_tx) = state.agents.lock().await.get(&agent_id) {
-                        let _ = agent_tx.send(message);
+                    if let Some(entry) = state.agents.lock().await.get(&agent_id) {
+                        let _ = entry.tx.send(message);
                     }
                 }
                 _ => {}

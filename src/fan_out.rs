@@ -175,7 +175,7 @@ async fn create_handler(
 
     let agents = state.agents.lock().await;
     for agent_id in &agent_ids {
-        if let Some(tx) = agents.get(agent_id) {
+        if let Some(entry) = agents.get(agent_id) {
             // Mark pending up-front so response routing can find it.
             let _ = db::upsert_fan_out_result(
                 &state.db,
@@ -186,7 +186,7 @@ async fn create_handler(
                 None,
             )
             .await;
-            if tx.send(message_template.clone()).is_err() {
+            if entry.tx.send(message_template.clone()).is_err() {
                 let _ = db::upsert_fan_out_result(
                     &state.db,
                     run_id,

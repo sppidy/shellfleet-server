@@ -80,11 +80,17 @@ struct TelegramPayload<'a> {
 
 fn truncate(s: &str, cap: usize) -> String {
     if s.len() <= cap {
-        s.to_string()
-    } else {
-        let cut = s.len() - cap;
-        format!("…[{cut} bytes truncated]…\n{}", &s[s.len() - cap..])
+        return s.to_string();
     }
+    // Slicing at `s.len() - cap` blind would panic if the index
+    // lands inside a multi-byte UTF-8 character. Walk forward to
+    // the next char boundary (guaranteed to exist at s.len()).
+    let mut start = s.len() - cap;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = start;
+    format!("…[{cut} bytes truncated]…\n{}", &s[start..])
 }
 
 fn last_n_lines(log: &str, n: usize) -> String {

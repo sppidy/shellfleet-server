@@ -273,7 +273,7 @@ async fn run_now_handler(
         return (StatusCode::BAD_REQUEST, "paths is empty").into_response();
     }
     let agents = state.agents.lock().await;
-    let Some(tx) = agents.get(&row.agent_id).cloned() else {
+    let Some(tx) = agents.get(&row.agent_id).map(|e| e.tx.clone()) else {
         return (StatusCode::NOT_FOUND, "agent offline").into_response();
     };
     drop(agents);
@@ -319,7 +319,7 @@ async fn list_archives_handler(
         }
     };
     let agents = state.agents.lock().await;
-    let Some(tx) = agents.get(&row.agent_id).cloned() else {
+    let Some(tx) = agents.get(&row.agent_id).map(|e| e.tx.clone()) else {
         return (StatusCode::NOT_FOUND, "agent offline").into_response();
     };
     drop(agents);
@@ -403,7 +403,7 @@ async fn restore_handler(
         }
     };
     let agents = state.agents.lock().await;
-    let Some(tx) = agents.get(&row.agent_id).cloned() else {
+    let Some(tx) = agents.get(&row.agent_id).map(|e| e.tx.clone()) else {
         return (StatusCode::NOT_FOUND, "agent offline").into_response();
     };
     drop(agents);
@@ -498,7 +498,7 @@ async fn scheduler_tick(state: &AppState) -> Result<(), sqlx::Error> {
             continue;
         }
         let agents = state.agents.lock().await;
-        let Some(tx) = agents.get(&row.agent_id).cloned() else {
+        let Some(tx) = agents.get(&row.agent_id).map(|e| e.tx.clone()) else {
             tracing::info!(agent_id = %row.agent_id, name = %row.name, "backup job due but agent offline");
             continue;
         };

@@ -149,8 +149,8 @@ pub async fn push_to_agent(state: &AppState, agent_id: &str) {
         .filter_map(row_to_spec)
         .collect();
     let agents = state.agents.lock().await;
-    if let Some(tx) = agents.get(agent_id) {
-        let _ = tx.send(Message::HealthProbeSyncRequest { probes });
+    if let Some(entry) = agents.get(agent_id) {
+        let _ = entry.tx.send(Message::HealthProbeSyncRequest { probes });
     }
 }
 

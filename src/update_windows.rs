@@ -190,7 +190,7 @@ async fn run_now_handler(
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     };
     let agents = state.agents.lock().await;
-    let Some(tx) = agents.get(&agent_id).cloned() else {
+    let Some(tx) = agents.get(&agent_id).map(|e| e.tx.clone()) else {
         return (StatusCode::NOT_FOUND, "Agent offline").into_response();
     };
     drop(agents);
@@ -260,7 +260,7 @@ async fn scheduler_tick(state: &AppState) -> Result<(), sqlx::Error> {
         }
         let agent_id = row.agent_id.clone();
         let agents = state.agents.lock().await;
-        let Some(tx) = agents.get(&agent_id).cloned() else {
+        let Some(tx) = agents.get(&agent_id).map(|e| e.tx.clone()) else {
             tracing::info!(agent_id = %agent_id, "update_window due but agent offline; deferring");
             continue;
         };
