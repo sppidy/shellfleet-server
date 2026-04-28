@@ -968,9 +968,10 @@ fn is_mutating_agent_message(msg: &Message) -> bool {
         | K8sListIngressesRequest
         | K8sListPvcsRequest
         | K8sListEventsRequest
-        | K8sDescribeRequest { .. }
-        | K8sLogsRequest { .. }
-        | K8sLogsStop { .. } => false,
+        | K8sDescribeRequest { .. } => false,
+        // K8sLogsRequest / K8sLogsStop are deliberately NOT in this
+        // list. Pod logs can leak Secrets, JWTs, and other sensitive
+        // material; streaming them is admin-only via the default arm.
         // Everything else is treated as mutating. AptRefreshRequest
         // counts as mutating because it triggers `apt-get update`,
         // which writes to /var/lib/apt/lists and can interact with
