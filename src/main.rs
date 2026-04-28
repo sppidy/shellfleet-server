@@ -928,7 +928,8 @@ fn is_mutating_agent_message(msg: &Message) -> bool {
         | K8sListServicesRequest
         | K8sListIngressesRequest
         | K8sListPvcsRequest
-        | K8sListEventsRequest => false,
+        | K8sListEventsRequest
+        | K8sDescribeRequest { .. } => false,
         // Everything else is treated as mutating. AptRefreshRequest
         // counts as mutating because it triggers `apt-get update`,
         // which writes to /var/lib/apt/lists and can interact with
