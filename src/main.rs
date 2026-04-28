@@ -921,7 +921,7 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
         tracing::info!(agent_id = %id, "agent disconnected");
         broadcast_agent_list(&state).await;
         // Outbound webhook fan-out (DISCONNECT_* env). Useful for
-        // "the amd64-builder fell off the network at 03:14" alerts.
+        // "agent X fell off the network at 03:14" alerts.
         // Independent prefix so this can route to a more urgent
         // sink than the daily apt-update channel.
         webhook::fire_agent_disconnect(state.db.clone(), id, now_unix());
