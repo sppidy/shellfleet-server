@@ -1087,8 +1087,15 @@ async fn handle_ui_socket(
                             _ => "viewer".to_string(),
                         };
                         if auth::Role::parse(&role_str) != auth::Role::Admin {
+                            let variant_type = serde_json::to_value(&message)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("type")
+                                        .and_then(|t| t.as_str().map(String::from))
+                                })
+                                .unwrap_or_else(|| "unknown".into());
                             tracing::warn!(
-                                %login, %agent_id,
+                                %login, %agent_id, variant = %variant_type,
                                 "ui ws: rejected mutating message from non-admin"
                             );
                             crate::db::record_audit(
@@ -1098,15 +1105,18 @@ async fn handle_ui_socket(
                                 Some(&agent_id),
                                 "ws.send_to_agent.denied",
                                 false,
-                                Some(&format!(
-                                    "role={role_str} variant={}",
-                                    serde_json::to_value(&message)
-                                        .ok()
-                                        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
-                                        .unwrap_or_else(|| "unknown".into())
-                                )),
+                                Some(&format!("role={role_str} variant={variant_type}")),
                             )
                             .await;
+                            // Tell the UI the request was rejected so the
+                            // calling panel doesn't sit in "waiting for
+                            // output…" forever. Best-effort; if the send
+                            // fails the client is already gone.
+                            let _ = tx.send(UiMessage::PermissionDenied {
+                                agent_id: agent_id.clone(),
+                                variant_type,
+                                reason: "admin only".to_string(),
+                            });
                             continue;
                         }
                     }
