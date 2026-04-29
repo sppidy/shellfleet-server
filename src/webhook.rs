@@ -108,7 +108,7 @@ fn last_n_lines(log: &str, n: usize) -> String {
 }
 
 fn slack_text(headline: &str, agent_id: &str, status: &str, error: Option<&str>, log: &str) -> String {
-    let icon = if matches!(status, "success" | "green") {
+    let icon = if matches!(status, "success" | "green" | "connected") {
         ":white_check_mark:"
     } else if status == "disconnected" {
         ":warning:"
@@ -127,7 +127,7 @@ fn slack_text(headline: &str, agent_id: &str, status: &str, error: Option<&str>,
 }
 
 fn discord_text(headline: &str, agent_id: &str, status: &str, error: Option<&str>, log: &str) -> String {
-    let icon = if matches!(status, "success" | "green") {
+    let icon = if matches!(status, "success" | "green" | "connected") {
         "✅"
     } else if status == "disconnected" {
         "⚠️"
@@ -230,7 +230,7 @@ impl RedactedToken {
 }
 
 fn telegram_text(headline: &str, agent_id: &str, status: &str, error: Option<&str>, log: &str) -> String {
-    let icon = if matches!(status, "success" | "green") {
+    let icon = if matches!(status, "success" | "green" | "connected") {
         "✅"
     } else if status == "disconnected" {
         "⚠️"
@@ -695,8 +695,11 @@ pub fn fire_backup_result(
 }
 
 /// `agent.disconnect` — fired when an agent's WS read loop exits and
-/// the server removes it from the live agents map. Reads `DISCONNECT_*`
-/// env. No log body; the chat formatters will skip the code block.
+/// the server removes it from the live agents map *and the
+/// reconnect grace window elapses without a re-register*. Reads
+/// `DISCONNECT_*` env. No log body; the chat formatters will skip
+/// the code block. The grace window is owned by `handle_agent_socket`
+/// in `main.rs`; this helper just posts the webhook.
 pub fn fire_agent_disconnect(db: SqlitePool, agent_id: String, at: i64) {
     fire(
         db,
@@ -706,6 +709,31 @@ pub fn fire_agent_disconnect(db: SqlitePool, agent_id: String, at: i64) {
             headline: "sys-manager agent".into(),
             agent_id,
             status: "disconnected".into(),
+            log: String::new(),
+            error: None,
+            at,
+        },
+    );
+}
+
+/// `agent.connect` — fired when an agent registers AFTER its
+/// `agent.disconnect` webhook had already gone out (i.e. it was
+/// offline past the 50s grace window so the operator was told it
+/// left; now they want to know it's back). Transient blips that
+/// reconnect within the grace window do NOT fire this — neither
+/// disconnect nor connect goes out for those. First-time
+/// registrations also stay silent (no prior disconnect to clear).
+/// Reads `CONNECT_*` env (falling back to the bare prefix-less
+/// defaults).
+pub fn fire_agent_connect(db: SqlitePool, agent_id: String, at: i64) {
+    fire(
+        db,
+        "CONNECT_",
+        Event {
+            kind: "agent.connect",
+            headline: "sys-manager agent".into(),
+            agent_id,
+            status: "connected".into(),
             log: String::new(),
             error: None,
             at,

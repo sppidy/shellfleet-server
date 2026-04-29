@@ -77,11 +77,32 @@ pub type PendingBackupListTx =
 pub type PendingBackupRestoreTx =
     tokio::sync::oneshot::Sender<shared::Message>;
 
+/// Disconnect debounce state. The agent webhook fan-out distinguishes
+/// "transient WS blip" from "agent is actually offline" by gating the
+/// `agent.disconnect` webhook behind a grace window
+/// (`DISCONNECT_GRACE_SECS`, default 50). On WS teardown we move the
+/// agent into `Pending(handle)`; if it re-registers before the handle
+/// fires we abort the handle and stay silent. If the handle fires, we
+/// post the disconnect webhook and transition to `Confirmed`. The next
+/// successful re-register on a `Confirmed` entry posts an
+/// `agent.reconnect` webhook so the operator knows it's back.
+pub enum DisconnectState {
+    /// Awaiting reconnect. The JoinHandle is the debounce task; abort
+    /// it on a fresh register to suppress both webhooks.
+    Pending(tokio::task::JoinHandle<()>),
+    /// Disconnect webhook has fired. The next register clears this and
+    /// posts the matching reconnect webhook.
+    Confirmed,
+}
+
 pub struct AppState {
     /// Live-agent registry: agent_id → (tx, capabilities). Single
     /// map (not two parallel ones) so a UI snapshot built under the
     /// lock is internally consistent. Cleared on disconnect.
     pub agents: Mutex<HashMap<String, AgentEntry>>,
+    /// Per-agent debounce state for the disconnect/reconnect webhook
+    /// pair. See `DisconnectState`.
+    pub disconnect_states: Mutex<HashMap<String, DisconnectState>>,
     pub ui_clients: Mutex<HashMap<u64, UiTx>>,
     pub ui_id_counter: AtomicU64,
     pub db: SqlitePool,
@@ -115,6 +136,20 @@ pub struct AppState {
 pub struct AgentAuth {
     pub token: String,
 }
+
+/// Grace window between an agent's WS read-loop exiting and the
+/// `agent.disconnect` webhook actually firing. Reconnects within
+/// this window are silent (no disconnect, no reconnect webhook).
+///
+/// 50s is derived from the existing architectural pair: the agent
+/// pings on a 25s cadence (matching the server-side WS heartbeat)
+/// and a single missed beat is normal (Cloudflare jitter, brief TCP
+/// retransmit). 50s = ~two missed heartbeats, which is a real "this
+/// agent is gone" signal, but still under the agent's 75s idle
+/// watchdog so a healthy systemd / kubelet restart cycle reconnects
+/// inside the grace and stays silent. Not an operator knob — it
+/// tracks those two underlying timeouts.
+const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(50);
 
 async fn broadcast_agent_list(state: &AppState) {
     let (agents, capabilities) = {
@@ -313,6 +348,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         agents: Mutex::new(HashMap::new()),
+        disconnect_states: Mutex::new(HashMap::new()),
         ui_clients: Mutex::new(HashMap::new()),
         ui_id_counter: AtomicU64::new(0),
         db: pool,
@@ -599,6 +635,48 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
                         capabilities = ?capabilities,
                         "agent registered"
                     );
+
+                    // Resolve any pending or confirmed disconnect for
+                    // this agent. Three cases:
+                    //   1. nothing in the map → first connect (or
+                    //      reconnect that already had its reconnect
+                    //      webhook delivered earlier) — no webhook.
+                    //   2. Pending(handle) → reconnect within the
+                    //      grace window. Abort the debounce task and
+                    //      suppress both the disconnect AND any
+                    //      reconnect webhook. The operator was never
+                    //      notified of a disconnect for this blip,
+                    //      so they don't need a reconnect either.
+                    //   3. Confirmed → the disconnect webhook fired
+                    //      already (the agent was offline past the
+                    //      grace window). Post an `agent.reconnect`
+                    //      webhook so the operator knows it's back.
+                    let prior = state
+                        .disconnect_states
+                        .lock()
+                        .await
+                        .remove(&id);
+                    match prior {
+                        Some(DisconnectState::Pending(handle)) => {
+                            handle.abort();
+                            tracing::info!(
+                                agent_id = %id,
+                                "agent reconnect within grace window — disconnect webhook suppressed"
+                            );
+                        }
+                        Some(DisconnectState::Confirmed) => {
+                            tracing::info!(
+                                agent_id = %id,
+                                "agent connected after confirmed disconnect — firing connect webhook"
+                            );
+                            webhook::fire_agent_connect(
+                                state.db.clone(),
+                                id.clone(),
+                                now_unix(),
+                            );
+                        }
+                        None => {}
+                    }
 
                     // Stamp the token's hostname + last_seen (and seed
                     // created_at on first contact) for the operator UI.
@@ -918,13 +996,57 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, token: Str
 
     if let Some(id) = agent_id_opt {
         state.agents.lock().await.remove(&id);
-        tracing::info!(agent_id = %id, "agent disconnected");
+        tracing::info!(agent_id = %id, "agent ws closed; debouncing disconnect webhook");
         broadcast_agent_list(&state).await;
-        // Outbound webhook fan-out (DISCONNECT_* env). Useful for
-        // "agent X fell off the network at 03:14" alerts.
+
+        // Debounced fan-out (DISCONNECT_* env). The agent is gone
+        // from `state.agents`, but transient WS blips (Cloudflare
+        // idle drop, kernel TCP reset, agent restart from systemd
+        // / kubelet) often resolve under the architectural
+        // 75s+25s window. Spawn a task that fires the webhook
+        // only if the agent is still gone after `DISCONNECT_GRACE`
+        // (100s, see the const). On a re-register within that
+        // window the register handler aborts this task and
+        // suppresses both webhooks. After the window elapses we
+        // transition to Confirmed; the next register on a
+        // Confirmed entry fires `fire_agent_reconnect` so the
+        // operator knows it's back.
         // Independent prefix so this can route to a more urgent
         // sink than the daily apt-update channel.
-        webhook::fire_agent_disconnect(state.db.clone(), id, now_unix());
+        let state_for_task = state.clone();
+        let id_for_task = id.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(DISCONNECT_GRACE).await;
+            // Atomic check-and-transition under the lock: only
+            // fire if our Pending entry is still there. If
+            // register beat us to it, the entry will have been
+            // removed and we stay silent.
+            let mut states = state_for_task.disconnect_states.lock().await;
+            let still_pending = matches!(
+                states.get(&id_for_task),
+                Some(DisconnectState::Pending(_)),
+            );
+            if !still_pending {
+                return;
+            }
+            states.insert(id_for_task.clone(), DisconnectState::Confirmed);
+            drop(states);
+            tracing::info!(
+                agent_id = %id_for_task,
+                grace_secs = DISCONNECT_GRACE.as_secs(),
+                "agent disconnect grace elapsed — firing webhook"
+            );
+            webhook::fire_agent_disconnect(
+                state_for_task.db.clone(),
+                id_for_task,
+                now_unix(),
+            );
+        });
+        state
+            .disconnect_states
+            .lock()
+            .await
+            .insert(id, DisconnectState::Pending(handle));
     }
 }
 
