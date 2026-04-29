@@ -34,17 +34,21 @@ fn key() -> Key<Aes256Gcm> {
     let mut h = Sha256::new();
     h.update(b"sys-manager-aead-v1");
     h.update(secret.as_bytes());
-    let digest = h.finalize();
-    *Key::<Aes256Gcm>::from_slice(&digest)
+    // Sha256::finalize() returns exactly 32 bytes, which is also the
+    // key size for Aes256Gcm — convert through a fixed-size array
+    // (avoids the deprecated GenericArray::from_slice call from the
+    // generic-array 0.14 era).
+    let digest: [u8; 32] = h.finalize().into();
+    Key::<Aes256Gcm>::from(digest)
 }
 
 pub fn encrypt(plaintext: &str) -> String {
     let cipher = Aes256Gcm::new(&key());
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .expect("aes-gcm encrypt should not fail with a valid key");
     format!(
         "{PREFIX}{}.{}",
@@ -66,7 +70,9 @@ pub fn decrypt(ciphertext: &str) -> Option<String> {
         return None;
     }
     let cipher = Aes256Gcm::new(&key());
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let pt = cipher.decrypt(nonce, ct_bytes.as_ref()).ok()?;
+    // Length was validated above, so this conversion is infallible.
+    let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.as_slice().try_into().ok()?;
+    let nonce = Nonce::from(nonce_arr);
+    let pt = cipher.decrypt(&nonce, ct_bytes.as_ref()).ok()?;
     String::from_utf8(pt).ok()
 }

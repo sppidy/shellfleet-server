@@ -1006,15 +1006,6 @@ pub async fn list_all_labels(pool: &SqlitePool) -> Result<Vec<(String, String)>,
     .await
 }
 
-pub async fn list_labels_for(pool: &SqlitePool, agent_id: &str) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT label FROM agent_labels WHERE agent_id = ? ORDER BY label",
-    )
-    .bind(agent_id)
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn agents_for_label(pool: &SqlitePool, label: &str) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
         "SELECT agent_id FROM agent_labels WHERE label = ? ORDER BY agent_id",
@@ -1193,6 +1184,11 @@ pub async fn purge_audit_before(pool: &SqlitePool, cutoff_ts: i64) -> Result<u64
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRow {
+    /// Required for sqlx::FromRow mapping of the SELECT * row even
+    /// though the struct's consumers only read `role` / `totp_*` /
+    /// timestamp fields. Dead-code analysis can't see the FromRow
+    /// derive's reflection-style usage.
+    #[allow(dead_code)]
     pub login: String,
     pub role: String,
     pub totp_enabled: i64,
@@ -1237,31 +1233,6 @@ pub async fn count_users(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
         .fetch_one(pool)
         .await
-}
-
-/// Insert the user if they don't exist (role defaulted by caller — admin
-/// for the very first user, viewer otherwise) and bump `last_login_at`.
-/// Returns the row as it stands after the upsert.
-pub async fn upsert_login(
-    pool: &SqlitePool,
-    login: &str,
-    default_role_if_new: &str,
-    now: i64,
-) -> Result<UserRow, sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO users (login, role, created_at, last_login_at)
-        VALUES (?1, ?2, ?3, ?3)
-        ON CONFLICT(login) DO UPDATE SET last_login_at = excluded.last_login_at
-        "#,
-    )
-    .bind(login)
-    .bind(default_role_if_new)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    let row = get_user(pool, login).await?.expect("just upserted");
-    Ok(row)
 }
 
 pub async fn set_user_role(
